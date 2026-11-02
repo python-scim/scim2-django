@@ -6,14 +6,34 @@ build-backend = "uv_build"
 name = "scim2-django"
 version = "0.0.0"
 description = "Painless SCIM integration for Django"
-readme = "README.md"
 authors = [
     { name = "Éloi Rivard", email = "eloi@yaal.coop" }
 ]
 license = "Apache-2.0"
+readme = "README.md"
+keywords = ["scim", "scim2", "provisioning", "django", "rfc7643", "rfc7644"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Development Status :: 3 - Alpha",
+    "Framework :: Django",
+    "Framework :: Django :: 5.2",
+    "Framework :: Django :: 6.0",
+    "Framework :: Django :: 6.1",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Environment :: Web Environment",
+    "Programming Language :: Python",
+    "Operating System :: OS Independent",
+]
 requires-python = ">=3.11"
 dependencies = [
-    "scim2-models>=0.6.9",
+    "django>=5.2",
+    "scim2-models>=0.12.2",
+    "scim2-server>=0.8.0",
 ]
 
 [project.urls]
@@ -23,9 +43,16 @@ funding = "https://github.com/sponsors/python-scim"
 
 [dependency-groups]
 dev = [
+    "django-stubs>=6.1.1",
     "mypy>=2.3.1",
-    "prek>=0.1.0",
-    "pytest>=8.2.1",
+    "prek>=0.5.3",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-django>=4.14.0",
+    "scim2-client>=0.14.1",
+    "scim2-server[cursor]>=0.8.0",
+    "scim2-tester[testing]>=0.6.4",
+    "tox-uv>=1.36.0",
 ]
 doc = [
     "myst-parser>=3.0.1",
@@ -33,6 +60,40 @@ doc = [
     "sphinx>=7.3.7",
     "sphinx-issues>=5.0.0",
 ]
+
+[tool.ruff.lint]
+select = [
+    "B", # flake8-bugbear
+    "D", # pydocstyle
+    "E", # pycodestyle
+    "F", # pyflakes
+    "I", # isort
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501", # line-too-long
+    "E722", # bare-except
+    "D100", # public module
+    "D101", # public class
+    "D102", # public method
+    "D103", # public function
+    "D104", # public package
+    "D105", # magic method
+    "D106", # nested class
+    "D107", # public init
+    "D203", # no-blank-line-before-class
+    "D213", # multi-line-summary-second-line
+]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.coverage.run]
+source = ["scim2_django", "examples", "tests"]
+branch = true
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
@@ -44,8 +105,72 @@ init_forbid_extra = true
 init_typed = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+pythonpath = ["."]
+testpaths = ["tests", "doc"]
+addopts = "--doctest-glob='*.rst'"
+doctest_optionflags = "ALLOW_UNICODE ELLIPSIS"
+DJANGO_SETTINGS_MODULE = "tests.settings"
+filterwarnings = ["error::scim2_tester.testing.ScimDeviationWarning"]
 
 [tool.uv]
 exclude-newer = "14 days"
 exclude-newer-package = { scim2-models = false, scim2-client = false, scim2-server = false, scim2-cli = false, scim2-tester = false, pytest-scim2-server = false }
+
+[tool.tox]
+requires = ["tox>=4.19"]
+env_list = [
+    "style",
+    "py311",
+    "py312",
+    "py313",
+    "py314",
+    "py315",
+    "django52",
+    "django60",
+    "django61",
+    "minversions",
+    "doc",
+    "coverage",
+]
+
+[tool.tox.env_run_base]
+runner = "uv-venv-lock-runner"
+dependency_groups = ["dev"]
+commands = [
+    ["pytest", "--showlocals", "--full-trace", "{posargs}"],
+]
+
+[tool.tox.env.style]
+runner = "uv-venv-runner"
+commands = [
+    ["prek", "run", "--all-files", "--show-diff-on-failure"],
+]
+
+[tool.tox.env.django52]
+runner = "uv-venv-runner"
+deps = ["django~=5.2.0"]
+
+[tool.tox.env.django60]
+runner = "uv-venv-runner"
+deps = ["django~=6.0.0"]
+
+[tool.tox.env.django61]
+runner = "uv-venv-runner"
+deps = ["django~=6.1.0"]
+
+[tool.tox.env.minversions]
+runner = "uv-venv-runner"
+uv_resolution = "lowest-direct"
+package = "editable"
+
+[tool.tox.env.doc]
+dependency_groups = ["doc"]
+commands = [
+    ["sphinx-build", "-W", "--keep-going", "--builder", "html", "doc", "build/sphinx/html"],
+]
+
+[tool.tox.env.coverage]
+commands = [
+    ["pytest", "--cov", "--cov-fail-under=100", "--cov-report", "term:skip-covered", "{posargs}"],
+    ["coverage", "html"],
+]

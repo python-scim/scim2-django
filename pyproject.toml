@@ -55,10 +55,11 @@ dev = [
     "tox-uv>=1.36.0",
 ]
 doc = [
-    "myst-parser>=3.0.1",
-    "shibuya>=2024.5.15",
-    "sphinx>=7.3.7",
-    "sphinx-issues>=5.0.0",
+    "shibuya>=2026.7.12",
+    "sphinx>=9.0.4",
+    "sphinx-design>=0.7.0",
+    "sphinx-issues>=6.0.0",
+    "sphinx-paramlinks>=0.6.0",
 ]
 
 [tool.ruff.lint]

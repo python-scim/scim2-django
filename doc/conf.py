@@ -1,12 +1,25 @@
 import datetime
+import os
+import sys
 from importlib import metadata
+
+import django
+from docutils import nodes
+
+sys.path.insert(0, os.path.abspath(".."))
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "examples.settings")
+django.setup()
 
 # -- General configuration ------------------------------------------------
 
 extensions = [
+    "sphinx.ext.autodoc",
+    "sphinx.ext.doctest",
     "sphinx.ext.intersphinx",
+    "sphinx.ext.viewcode",
+    "sphinx_design",
     "sphinx_issues",
-    "myst_parser",
+    "sphinx_paramlinks",
 ]
 
 templates_path = ["_templates"]
@@ -15,10 +28,6 @@ project = "scim2-django"
 year = datetime.datetime.now().strftime("%Y")
 copyright = f"{year}, Yaal Coop"
 author = "Yaal Coop"
-source_suffix = {
-    ".rst": "restructuredtext",
-    ".md": "markdown",
-}
 
 version = metadata.version("scim2-django")
 language = "en"
@@ -27,6 +36,11 @@ toctree_collapse = False
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
+    "django": (
+        "https://docs.djangoproject.com/en/stable/",
+        "https://docs.djangoproject.com/en/stable/_objects/",
+    ),
+    "scim2_server": ("https://scim2-server.readthedocs.io/en/latest/", None),
     "scim2_models": ("https://scim2-models.readthedocs.io/en/latest/", None),
     "scim2_client": ("https://scim2-client.readthedocs.io/en/latest/", None),
     "scim2_tester": ("https://scim2-tester.readthedocs.io/en/latest/", None),
@@ -128,3 +142,30 @@ html_context = {
 # -- Options for sphinx-issues -------------------------------------
 
 issues_github_path = "python-scim/scim2-django"
+
+
+# -- Roles ----------------------------------------------------------------
+
+MDN_HEADERS_URL = "https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/"
+
+
+def mdn_role(name, rawtext, text, lineno, inliner, options=None, content=None):
+    """Link an HTTP header to its MDN page, and render its name as code."""
+    reference = nodes.reference(
+        rawtext, "", nodes.literal(text, text), refuri=MDN_HEADERS_URL + text
+    )
+    return [reference], []
+
+
+def setup(app):
+    app.add_role("mdn", mdn_role)
+    app.add_crossref_type(
+        directivename="setting",
+        rolename="setting",
+        indextemplate="pair: %s; setting",
+    )
+    app.add_crossref_type(
+        directivename="django-admin",
+        rolename="djadmin",
+        indextemplate="pair: %s; django-admin command",
+    )

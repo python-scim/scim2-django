@@ -2,6 +2,87 @@
 
 # scim2-django
 
-This repository is empty at the moment.
-This is a placeholder for a library that will help implementing SCIM2 servers with Django painlessly.
-In the meantime, you can [integrate scim2-server with Django](https://scim2-server.readthedocs.io/en/latest/how-to/integrate-a-web-framework.html).
+Serve a SCIM 2.0 server from a [Django](https://www.djangoproject.com/) project, as
+[RFC7643](https://datatracker.ietf.org/doc/html/rfc7643) and
+[RFC7644](https://datatracker.ietf.org/doc/html/rfc7644) define it. It is built upon
+[scim2-server](https://scim2-server.readthedocs.io/) and
+[scim2-models](https://scim2-models.readthedocs.io/). The project provides the storage.
+
+## Features
+
+- Resource endpoints: `POST`, `GET`, `PUT`, `PATCH` and `DELETE`, for every resource type
+- Search: `GET` and `POST /.search`, per resource type and at the server root
+- Discovery endpoints: `/ServiceProviderConfig`, `/ResourceTypes` and `/Schemas`
+- Bulk operations: `POST /Bulk`, with `bulkId` references, `failOnErrors`, `maxOperations` and
+  `maxPayloadSize`
+- `/Me`, once the project tells which resource the authenticated client stands for
+- Conditional requests with ETags: `If-Match` and `If-None-Match`
+- SCIM error payloads for every failure
+- Several SCIM servers in one project, each with its own URL namespace
+
+## Example
+
+```python
+# urls.py
+from django.urls import path
+from scim2_models import ScimProvider, User
+from scim2_server.storage import ScimStorage
+
+from scim2_django import ScimSite
+
+
+class MyStorage(ScimStorage): ...
+
+
+def authenticate(request): ...
+
+
+site = ScimSite(MyStorage(), ScimProvider(models=[User]), authenticate=authenticate)
+
+urlpatterns = [
+    path("scim/v2/", site.urls),
+]
+```
+
+## Installation
+
+```shell
+pip install scim2-django
+```
+
+## Documentation
+
+- [Overview](https://scim2-django.readthedocs.io/en/latest/overview.html) introduces the parts
+  of a SCIM server built with Django.
+- [How-to guides](https://scim2-django.readthedocs.io/en/latest/how-to/index.html) cover
+  authentication, URLs, reverse proxies, request sizes and transactions.
+- [Reference](https://scim2-django.readthedocs.io/en/latest/reference.html) lists the public API.
+
+## What's SCIM anyway?
+
+SCIM stands for System for Cross-domain Identity Management, and it is a provisioning protocol.
+Provisioning is the action of managing a set of resources across different services, usually
+users and groups. SCIM is often used between Identity Providers and applications, alongside
+standards like OAuth2 and OpenID Connect. It allows users and groups creations, modifications and
+deletions to be synchronized between applications.
+
+## Getting help
+
+Questions and bug reports go to the
+[issue tracker](https://github.com/python-scim/scim2-django/issues).
+
+## Contributing
+
+The [contribution page](https://scim2-django.readthedocs.io/en/latest/contributing.html)
+describes how to run the tests, the style checks and the documentation build.
+
+## License
+
+scim2-django is released under the Apache-2.0 license.
+
+scim2-django belongs in a collection of SCIM tools developed by [Yaal Coop](https://yaal.coop),
+with [scim2-models](https://github.com/python-scim/scim2-models),
+[scim2-client](https://github.com/python-scim/scim2-client),
+[scim2-server](https://github.com/python-scim/scim2-server),
+[scim2-tester](https://github.com/python-scim/scim2-tester) and
+[scim2-cli](https://github.com/python-scim/scim2-cli).

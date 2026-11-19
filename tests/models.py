@@ -4,6 +4,20 @@ from django.db import models
 from django.db.models.functions import Lower
 
 
+class CodeField(models.TextField):
+    """A text field converting the codes it reads, as a field decrypting its values would."""
+
+    def from_db_value(self, value, expression, connection):
+        return None if value is None else value.upper()
+
+
+class LooseTextField(models.Field):
+    """A field built on Field, which Django stores as text."""
+
+    def get_internal_type(self):
+        return "TextField"
+
+
 class UserRecord(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4)
     external_id = models.TextField(null=True)
@@ -47,6 +61,8 @@ class CertificateRecord(models.Model):
         UserRecord, on_delete=models.CASCADE, related_name="certificates"
     )
     value = models.BinaryField()
+    display = models.TextField(null=True)
+    primary = models.BooleanField(default=False)
 
 
 class GroupRecord(models.Model):
@@ -73,8 +89,14 @@ class Person(models.Model):
     id = models.TextField(primary_key=True)
     user_name = models.TextField()
     data = models.JSONField(null=True)
+    code = CodeField(null=True)
+    status = models.TextField(default="new")
+    note = LooseTextField(null=True)
+    enabled = models.BooleanField()
+    verified = models.BooleanField(db_default=False)
+    touched = models.DateTimeField(auto_now=True)
     mentor = models.ForeignKey(UserRecord, on_delete=models.CASCADE)
-    label = models.TextField(null=True)
+    label = models.TextField(null=True, choices=[("Mr", "Mister"), ("Ms", "Miss")])
     created = models.DateTimeField()
     last_modified = models.DateTimeField()
     version = models.PositiveIntegerField(default=1)
@@ -107,6 +129,7 @@ class TaggedUser(models.Model):
 class Tag(models.Model):
     user = models.ForeignKey(TaggedUser, on_delete=models.CASCADE, related_name="tags")
     value = models.TextField()
+    note = models.TextField(null=True)
 
     class Meta:
         ordering = ["id"]

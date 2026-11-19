@@ -1,3 +1,4 @@
+import datetime
 import sys
 from typing import Annotated
 
@@ -8,6 +9,8 @@ from django.core.exceptions import AppRegistryNotReady
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
 from django.core.management.base import SystemCheckError
+from django.db.models import F
+from django.db.models import TextField
 from django.db.models import Value
 from django.db.models.functions import Concat
 from scim2_models import URN
@@ -50,6 +53,8 @@ class Owned(Extension):
 
     owner: Annotated[Owner | None, Required.true] = None
     sponsor: Owner | None = None
+    since: datetime.datetime | None = None
+    verified: bool | None = None
 
 
 OWNED = "urn:example:params:scim:schemas:extension:owned:2.0:User"
@@ -305,7 +310,7 @@ def test_a_missing_identifier_field_is_reported_once():
 
 def test_a_converting_field_holding_a_string_is_reported():
     """Filters and sorts compare the stored values, which such a field converts when it reads them."""
-    mapping = person_mapping(title="data")
+    mapping = person_mapping(title="code")
 
     (warning,) = mapping.check()
     assert warning.id == "scim2_django.W001"
@@ -314,7 +319,7 @@ def test_a_converting_field_holding_a_string_is_reported():
 
 def test_a_converting_field_never_read_is_not_reported():
     """A write-only attribute is never filtered nor sorted."""
-    mapping = person_mapping(title=Attribute("data", readable=False))
+    mapping = person_mapping(title=Attribute("code", readable=False))
 
     assert mapping.check() == []
 
@@ -329,7 +334,7 @@ def test_a_mapping_with_errors_cannot_be_used():
 
 def test_a_mapping_with_warnings_can_be_used():
     """A warning tells about a doubtful mapping, without refusing it."""
-    mapping = person_mapping(title="data")
+    mapping = person_mapping(title="code")
 
     assert mapping.schemas()
 
@@ -341,6 +346,7 @@ def test_manage_py_check_reports_the_mappings():
 
     with pytest.raises(SystemCheckError, match=r"tests.Person>: \(scim2_django.E001\)"):
         call_command("check")
+
     assert mapping
 
 
@@ -392,7 +398,9 @@ def test_a_generated_field_is_published_read_only():
 
 def test_a_computed_attribute_is_published_read_only():
     """A query expression is read, never written."""
-    computed = Computed(Concat("given_name", Value(" "), "family_name"))
+    computed = Computed(
+        Concat("given_name", Value(" "), "family_name", output_field=TextField())
+    )
     (user, _) = users_mapping({"displayName": computed}).schemas()
 
     (display_name,) = [a for a in user.attributes if a.name == "displayName"]
@@ -496,6 +504,7 @@ def test_a_mapping_links_to_the_same_mappings_in_every_storage():
     groups = groups_mapping()
     for mapping in (groups, users := users_mapping(), other := users_mapping()):
         mapping.schemas()
+
     groups._bind(groups._targets({"User": users, "Group": groups}))
 
     with pytest.raises(ImproperlyConfigured, match="already links to another mapping"):
@@ -523,6 +532,7 @@ def test_a_group_links_to_users_and_groups():
     users, groups = users_mapping(), groups_mapping()
     for mapping in (users, groups):
         mapping.schemas()
+
     for mapping in (users, groups):
         mapping._bind(mapping._targets({"User": users, "Group": groups}))
 
@@ -540,6 +550,7 @@ def test_a_link_to_resources_without_a_name_has_no_display():
     users = users_mapping()
     for mapping in (users, groups):
         mapping.schemas()
+
     groups._bind(groups._targets({"User": users, "Group": groups}))
 
     _, group_link = groups._collections[(Group, "members")]
@@ -607,6 +618,7 @@ def test_the_fields_of_the_entries_are_named():
     field = Person._meta.get_field("label")
     with pytest.raises(ValueError, match="'emails.value' must be mapped to the name"):
         person_mapping(emails=Many("addresses", {"value": field}))
+
     with pytest.raises(ValueError, match=f"'{TAGGED}:tags' must be mapped to the name"):
         tagged_mapping(field)
 
@@ -637,11 +649,36 @@ def test_a_required_link_takes_a_foreign_key_that_cannot_be_null():
     assert mapping.check() == []
 
 
-def test_a_string_mapped_to_a_field_not_holding_text_is_reported():
-    """A UUID field compares its stored form, which is not the text clients read."""
-    (warning,) = users_mapping({"externalId": "id"}).check()
+@pytest.mark.parametrize(
+    "changes",
+    [{"externalId": "id"}, {"title": "version"}],
+    ids=["uuid", "integer"],
+)
+def test_a_string_mapped_to_a_field_not_holding_text_is_refused(changes):
+    """Filters would compare, and writes store, something else than the strings clients send."""
+    assert error_ids(users_mapping(changes)) == ["scim2_django.E008"]
 
-    assert warning.id == "scim2_django.W001"
+
+def test_a_string_mapped_to_a_json_field_is_refused():
+    """A JSON field holds documents, not strings."""
+    assert error_ids(person_mapping(title="data")) == ["scim2_django.E008"]
+
+
+def test_a_binary_value_is_held_by_a_binary_field():
+    """A certificate is a string in base64 for clients, and bytes in the database."""
+    mapping = users_mapping(
+        {"x509Certificates": Many("certificates", {"value": "value"})}
+    )
+
+    assert mapping.check() == []
+
+
+def test_a_write_only_attribute_of_the_schema_is_never_read():
+    """The password is write-only in the schema, so mapping it by its name is enough to keep it from being read."""
+    mapping = users_mapping({"password": "password"})
+    mapping.schemas()
+
+    assert not mapping._column("password").readable
 
 
 def test_the_checks_wait_for_the_models(monkeypatch):
@@ -651,6 +688,7 @@ def test_the_checks_wait_for_the_models(monkeypatch):
 
     with pytest.raises(AppRegistryNotReady):
         mapping.check()
+
     monkeypatch.undo()
     assert mapping.check() == []
 
@@ -676,6 +714,7 @@ def test_a_failed_binding_binds_nothing():
 
     with pytest.raises(ImproperlyConfigured, match="'Group'"):
         groups._bind(groups._targets({"User": users}))
+
     groups._bind(groups._targets({"User": users, "Group": groups}))
     user_link, _ = groups._collections[(Group, "members")]
     assert user_link.target is users
@@ -707,3 +746,74 @@ def test_an_attribute_is_mapped_once(changes, message):
     """A second mapping of an attribute, or of a part of it, would silently replace the first."""
     with pytest.raises(ValueError, match=message):
         users_mapping(changes)
+
+
+def test_the_entries_of_another_model_cannot_be_computed():
+    """The expression would need an annotation of the entries, which the storage does not make."""
+    with pytest.raises(ValueError, match="'emails.value' is held by the entries"):
+        users_mapping({"emails": Many("emails", {"value": Computed(Value("x"))})})
+
+
+def test_the_type_of_a_link_is_found_in_each_link():
+    """Filters compare the type of a member as the constant of each Link."""
+    groups = groups_mapping()
+    groups.schemas()
+
+    pairs = groups._lookup(groups._find("members.type"))
+
+    assert [column.key for _, column in pairs] == ["type", "type"]
+
+
+@pytest.mark.parametrize(
+    "emails",
+    [
+        Many("emails", {"value": "value", "type": Attribute("type", readable=False)}),
+        Many("emails", {"value": Attribute("value", readable=False)}),
+        Many("emails", {"value": "value", "type": Attribute("type", writable=False)}),
+    ],
+    ids=["write-only next to readable", "write-only", "read-only next to written"],
+)
+def test_entries_that_a_write_would_partly_lose_are_refused(emails):
+    """A write replaces the entries, so a value the client never sends back would be lost."""
+    (error,) = users_mapping({"emails": emails}).check()
+
+    assert error.id == "scim2_django.E007"
+
+
+def test_a_list_of_write_only_strings_is_refused():
+    """A PATCH adding a tag would replace the tags clients never read back."""
+    (error,) = tagged_mapping(Attribute("value", readable=False)).check()
+
+    assert error.id == "scim2_django.E007"
+
+
+def test_entries_only_read_are_left_as_they_are():
+    """Entries whose every sub-attribute is only read are not written at all."""
+    mapping = users_mapping(
+        {"emails": Many("emails", {"value": Attribute("value", writable=False)})}
+    )
+
+    assert mapping.check() == []
+    emails = next(c for c in mapping._all_collections() if c.owned)
+    assert not emails.writable
+
+
+def test_a_string_computed_by_an_expression_not_giving_text_is_refused():
+    """The version is an integer, so it cannot give a title."""
+    assert error_ids(users_mapping({"title": Computed(F("version"))})) == [
+        "scim2_django.E008"
+    ]
+
+
+def test_an_expression_the_model_cannot_compute_is_refused():
+    """A typo in an expression shows up in manage.py check."""
+    mapping = users_mapping({"title": Computed(F("versoin_number"))})
+
+    (error,) = mapping.check()
+    assert error.id == "scim2_django.E009"
+    assert "'title' cannot be computed" in error.msg
+
+
+def test_a_field_stored_as_text_holds_a_string():
+    """A field built on Field, but stored as text, holds a string."""
+    assert person_mapping(title="note").check() == []

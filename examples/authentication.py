@@ -11,8 +11,8 @@ TOKENS = {"secret": "bjensen"}
 
 
 def authenticate(request):
-    token = request.headers.get("Authorization", "").removeprefix("Bearer ")
-    if token not in TOKENS:
+    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or token not in TOKENS:
         raise UnauthorizedException(detail="Missing or invalid token")
     return TOKENS[token]
 

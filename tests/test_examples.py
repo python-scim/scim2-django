@@ -39,6 +39,31 @@ def test_example_authentication_accepts_clients_with_a_known_token(client):
     assert response.status_code == 200
 
 
+def test_example_authentication_refuses_a_token_without_scheme(client):
+    response = client.get(
+        "/protected/scim/v2/Users", headers={"Authorization": "secret"}
+    )
+
+    assert response.status_code == 401
+
+
+def test_example_authentication_refuses_a_token_of_another_scheme(client):
+    response = client.get(
+        "/protected/scim/v2/Users", headers={"Authorization": "Basic secret"}
+    )
+
+    assert response.status_code == 401
+
+
+def test_example_authentication_accepts_the_scheme_in_any_case(client):
+    """Per RFC 9110 §11.1, the authentication scheme is case-insensitive."""
+    response = client.get(
+        "/protected/scim/v2/Users", headers={"Authorization": "bearer secret"}
+    )
+
+    assert response.status_code == 200
+
+
 def test_example_authentication_leaves_the_service_provider_config_open(client):
     response = client.get("/protected/scim/v2/ServiceProviderConfig")
 

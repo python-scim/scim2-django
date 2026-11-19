@@ -5,6 +5,8 @@ INSTALLED_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "django.contrib.sessions",
+    "scim2_django",
+    "tests",
 ]
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",

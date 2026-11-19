@@ -8,6 +8,7 @@ from django.urls import URLResolver
 from scim2_server.memory import InMemoryStorage
 
 from examples import scim
+from scim2_django.storage.mapping import _MAPPINGS
 
 
 class URLconf:
@@ -45,3 +46,11 @@ def example_storage() -> Iterator[None]:
     scim.site.storage = scim.site.handler.storage = InMemoryStorage()
     yield
     scim.site.storage = scim.site.handler.storage = storage
+
+
+@pytest.fixture(autouse=True)
+def forget_the_mappings() -> Iterator[None]:
+    """Check, in each test, the mappings this test creates only."""
+    _MAPPINGS.clear()
+    yield
+    _MAPPINGS.clear()

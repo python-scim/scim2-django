@@ -52,7 +52,7 @@ dev = [
     "pytest-django>=4.14.0",
     "pytest-postgresql>=10.0.0",
     "scim2-client>=0.14.1",
-    "scim2-server[cursor]>=0.8.1",
+    "scim2-server[cursor]>=0.8.7",
     "scim2-tester[testing]>=0.6.4",
     "tox-uv>=1.36.0",
 ]

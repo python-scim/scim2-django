@@ -100,8 +100,8 @@ def test_a_refused_mapping_binds_no_mapping():
 class Concurrent(DjangoStorage):
     """A storage where another transaction writes each record after it is read."""
 
-    def _check_version(self, mapping, record, expected_version):
-        mapping.record.objects.update(version=F("version") + 1)
+    def _check_version(self, stored, expected_version):
+        UserRecord.objects.update(version=F("version") + 1)
 
 
 def test_a_write_since_the_record_was_read_is_refused():
@@ -113,7 +113,7 @@ def test_a_write_since_the_record_was_read_is_refused():
         server.storage.update(server.users, user)
 
     with pytest.raises(PreconditionFailedException):
-        server.storage.delete(server.users, user.id)
+        server.storage.delete(server.users, user.id, expected_version=user.meta.version)
 
     assert UserRecord.objects.filter(user_name="bjensen").exists()
 

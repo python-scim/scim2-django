@@ -375,9 +375,14 @@ class _Collection:
         return {relation.target_field.attname: OuterRef(relation.attname)}
 
     def order(self) -> list[Any]:
-        """Return the order of the entries: the one of their default manager, or of their model, or else their primary key."""
+        """Return the order of the entries: the one of their default manager, or else of their model, then their primary key.
+
+        The primary key orders the entries an ordering leaves tied, so that
+        they always come in the same order.
+        """
         entries = self.entry_model._default_manager.all()
-        return list(entries.query.order_by or self.entry_model._meta.ordering or ["pk"])
+        ordering: Any = entries.query.order_by or self.entry_model._meta.ordering
+        return [*ordering, "pk"]
 
     def prefetch(self) -> "Prefetch[Any]":
         """Return how to load the entries along with the records, in the order they are read."""
@@ -417,18 +422,27 @@ class ResourceMapping:
     :param record: The Django model of the records.
     :param attributes: The attributes, by SCIM path. A value is the name of a
         field, an :class:`Attribute`, a :class:`Computed`, a :class:`Many`, a
-        :class:`Link`, or a list of :class:`Link`. ``id``, ``meta.created``
-        and ``meta.lastModified`` are required.
+        :class:`Link`, or a list of :class:`Link`. ``id`` is required.
+        ``meta.created`` and ``meta.lastModified`` are filled by the storage:
+        without them, the resources have no such date.
     :param version: The name of an integer field counting the writes of each
         record, which gives ``meta.version``. A write changes the version of
         the written resource only: adding a member to a group changes the
         version of the group, not the one of the user, although the
-        ``groups`` of the user change.
+        ``groups`` of the user change. Without it, ``meta.version`` is a hash
+        of the whole resource, which any change changes. The storage then
+        reads every collection of a resource, even those a response leaves
+        out, such as the members of a group: prefer a version field for large
+        groups. The hash protects the writes on databases that read committed
+        data, as PostgreSQL and SQLite do. Under the repeatable reads of
+        MySQL, use a version field.
     :raises ValueError: When a path is not valid for the model, or when a
         value does not fit the attribute of its path.
     """
 
-    _REQUIRED = ("id", "meta.created", "meta.lastModified")
+    _REQUIRED = ("id",)
+    _FIELDS = ("id", "meta.created", "meta.lastModified")
+    """The attributes the storage fills itself, which a field holds as it is."""
 
     def __init__(
         self,
@@ -436,7 +450,7 @@ class ResourceMapping:
         record: type[models.Model],
         attributes: Mapping[str, Any],
         *,
-        version: str,
+        version: str | None = None,
     ) -> None:
         self.model = model
         self.record = record
@@ -690,9 +704,13 @@ class ResourceMapping:
     def _returned_collections(
         self, parameters: ResponseParameters[Any] | None = None
     ) -> list[_Collection]:
-        """Return the collections a response keeps, all of them without parameters."""
+        """Return the collections a response keeps, all of them without parameters.
+
+        Without a version field, the version is a hash of the whole resource,
+        so every collection is kept.
+        """
         collections = list(self._all_collections())
-        if parameters is None:
+        if parameters is None or self.version is None:
             return collections
 
         paths = Path[self.model].iter_paths(  # type: ignore[name-defined]
@@ -857,8 +875,8 @@ class ResourceMapping:
 
         self._check_value(path, binding)
         self._check_field_value(path, value)
-        required = {_key(self._resolve(path)) for path in self._REQUIRED}
-        if _key(binding) in required and not isinstance(value, str):
+        fields = {_key(self._resolve(path)) for path in self._FIELDS}
+        if _key(binding) in fields and not isinstance(value, str):
             raise ValueError(f"{path!r} must be mapped to the name of a field")
 
         self._declared[path] = (binding, value)
@@ -962,13 +980,17 @@ class ResourceMapping:
 
         self._id = self._column("id")
         self._id.textual = not isinstance(self._id.field, _TEXT_FIELDS)
-        self._created = self._column("meta.created")
-        self._last_modified = self._column("meta.lastModified")
+        self._created = self._columns.get(_key(self._resolve("meta.created")))
+        self._last_modified = self._columns.get(
+            _key(self._resolve("meta.lastModified"))
+        )
         for path, column in (
             ("meta.created", self._created),
             ("meta.lastModified", self._last_modified),
         ):
-            if not isinstance(column.field, models.DateTimeField):
+            if column is not None and not isinstance(
+                column.field, models.DateTimeField
+            ):
                 yield self._error(
                     f"{path!r} must be mapped to a date and time field",
                     "scim2_django.E006",
@@ -992,6 +1014,9 @@ class ResourceMapping:
 
     def _check_version(self) -> Iterator[checks.CheckMessage]:
         """Refuse a version that is not an integer field of the record."""
+        if self.version is None:
+            return
+
         field = yield from self._field(self.record, self.version, "version")
         if field is not None and not isinstance(field, models.IntegerField):
             yield self._error(

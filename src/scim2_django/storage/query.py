@@ -65,6 +65,21 @@ _LOOKUPS = {
 }
 """The names of the lookups, by operator."""
 
+_NUMBERS = {
+    "AutoField",
+    "BigAutoField",
+    "BigIntegerField",
+    "DecimalField",
+    "FloatField",
+    "IntegerField",
+    "PositiveBigIntegerField",
+    "PositiveIntegerField",
+    "PositiveSmallIntegerField",
+    "SmallAutoField",
+    "SmallIntegerField",
+}
+"""The internal types of the fields holding numbers."""
+
 _TRUE = Q(Value(True, output_field=BooleanField()))
 _FALSE = Q(Value(False, output_field=BooleanField()))
 
@@ -547,25 +562,21 @@ def _root_search(
     """
     conditions = [_where(mapping, search_request, comparator) for mapping in mappings]
     keys = [_sort_key(mapping, search_request, comparator) for mapping in mappings]
-    outputs = [
-        _output_field(mapping, key)
-        for mapping, key in zip(mappings, keys, strict=True)
+    outputs = {
+        position: _output_field(mapping, key)
+        for position, (mapping, key) in enumerate(zip(mappings, keys, strict=True))
         if key is not None
-    ]
-    if len({output.get_internal_type() for output in outputs}) > 1:
+    }
+    if len({_family(output) for output in outputs.values()}) > 1:
         raise InvalidPathException(
             path=str(search_request.sort_by),
             detail=f"Cannot sort on '{search_request.sort_by}' at the root: "
             "the resource types store it in fields of different types",
         )
 
-    output = outputs[0] if outputs else None
+    output = next(iter(outputs.values()), None)
     if anchor is not None:
-        if anchor.ties[0] not in range(len(mappings)):
-            raise InvalidCursorException
-
-        if output is not None:
-            anchor = _typed_anchor(output, anchor)
+        anchor = _root_anchor(outputs, len(mappings), anchor)
 
     matching = []
     rows = []
@@ -614,6 +625,31 @@ def _root_search(
 
     stop = None if search_request.count is None else search_request.count + 1
     return total, list(page[:stop])
+
+
+def _family(field: Any) -> str:
+    """Return the family of the values of a field: numbers form one family, as the databases compare them together."""
+    internal_type = field.get_internal_type()
+    return "number" if internal_type in _NUMBERS else internal_type
+
+
+def _root_anchor(outputs: dict[int, Any], count: int, anchor: _Anchor) -> _Anchor:
+    """Return an anchor of a search at the root, with a sort value of the type of the field of its row.
+
+    The anchor needs the position of a searched resource type, and a sort
+    value only when that type has a sort key.
+    """
+    position = anchor.ties[0]
+    if position not in range(count):
+        raise InvalidCursorException
+
+    if anchor.key is None:
+        return anchor
+
+    if position not in outputs:
+        raise InvalidCursorException
+
+    return _typed_anchor(outputs[position], anchor)
 
 
 def _output_field(mapping: ResourceMapping, key: Any) -> Any:

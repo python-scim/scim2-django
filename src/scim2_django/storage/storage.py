@@ -32,7 +32,6 @@ from .conversion import _comparable
 from .conversion import _from_scim
 from .conversion import _link_entries
 from .conversion import _to_scim
-from .conversion import _version
 from .conversion import _write_collections
 from .keyset import _Anchor
 from .keyset import _anchor
@@ -127,6 +126,10 @@ class DjangoStorage(ScimStorage):
     The storage searches one resource type, or several at the root of the
     server as one collection. It pages by index, or with cursors that give
     stable pages (:rfc:`RFC 9865 <9865>`).
+
+    On SQLite, set ``"transaction_mode": "IMMEDIATE"`` in the
+    :setting:`OPTIONS <DATABASE-OPTIONS>` of the database, so that a write
+    waits for another one rather than failing with ``database is locked``.
 
     :param mappings: The mapping of each resource type, by resource type name.
     :param provider: The provider of the server. The storage then returns
@@ -274,8 +277,10 @@ class DjangoStorage(ScimStorage):
             links = self._links(mapping, resource)
             record = mapping.record()
             now = _now()
-            setattr(record, mapping._created.key, now)
-            setattr(record, mapping._last_modified.key, now)
+            for column in (mapping._created, mapping._last_modified):
+                if column is not None:
+                    setattr(record, column.key, now)
+
             _from_scim(mapping, resource, record, links, creating=True)
             self._save(mapping, resource, record, links, None)
 
@@ -291,20 +296,25 @@ class DjangoStorage(ScimStorage):
         """Replace a resource, and return it as stored.
 
         The record is locked until the end of the transaction, on the
-        databases that lock rows. A write by another transaction in the
-        meantime raises :class:`~scim2_models.PreconditionFailedException`.
+        databases that lock rows. With an ``expected_version`` the stored
+        version does not match, the update raises
+        :class:`~scim2_models.PreconditionFailedException`. With a version
+        field, so does a write by another transaction since the record was
+        read, even without ``expected_version``.
         """
         mapping = self._mapping(resource_type)
         with transaction.atomic(using=self.using):
             record = self._load(resource_type, resource.id, locked=True)
-            self._check_version(mapping, record, expected_version)
             stored = self._to_scim(resource_type, record)
+            self._check_version(stored, expected_version)
             _check_storable(mapping, resource, stored)
             self._check_uniqueness(mapping, resource, stored)
             links = self._links(mapping, resource)
             self._count_write(mapping, record)
             _from_scim(mapping, resource, record, links, creating=False)
-            setattr(record, mapping._last_modified.key, _now())
+            if mapping._last_modified is not None:
+                setattr(record, mapping._last_modified.key, _now())
+
             self._save(mapping, resource, record, links, stored)
 
         return self.get(resource_type, resource.id)  # type: ignore[arg-type]
@@ -320,7 +330,10 @@ class DjangoStorage(ScimStorage):
         mapping = self._mapping(resource_type)
         with transaction.atomic(using=self.using):
             record = self._load(resource_type, resource_id, locked=True)
-            self._check_version(mapping, record, expected_version)
+            if expected_version is not None:
+                stored = self._to_scim(resource_type, record)
+                self._check_version(stored, expected_version)
+
             self._count_write(mapping, record)
             record.delete(using=self.using)
 
@@ -431,14 +444,12 @@ class DjangoStorage(ScimStorage):
         )
 
     @staticmethod
-    def _check_version(
-        mapping: ResourceMapping, record: Any, expected_version: str | None
-    ) -> None:
-        """Refuse to change a record whose version is not the expected one."""
+    def _check_version(stored: Resource[Any], expected_version: str | None) -> None:
+        """Refuse to change a resource whose version is not the expected one."""
         if expected_version is None:
             return
 
-        if _version(mapping, record) != expected_version:
+        if stored.meta.version != expected_version:  # type: ignore[union-attr]
             raise PreconditionFailedException
 
     def _count_write(self, mapping: ResourceMapping, record: Any) -> None:
@@ -447,7 +458,11 @@ class DjangoStorage(ScimStorage):
         The version is raised only if it is still the one the record was read
         with, so that a write by another transaction since raises a 412 rather
         than being lost. Databases that lock rows wait for the other transaction instead.
+        Without a version field, the hash of the resource changes by itself.
         """
+        if mapping.version is None:
+            return
+
         version = getattr(record, mapping.version)
         written = (
             mapping.record._default_manager.using(self.using)

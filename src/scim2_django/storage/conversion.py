@@ -1,5 +1,6 @@
 import base64
 import datetime
+import json
 from collections.abc import Iterable
 from collections.abc import Mapping
 from enum import Enum
@@ -8,6 +9,7 @@ from typing import Any
 
 from django.conf import settings
 from django.db import models
+from django.utils.crypto import salted_hmac
 from pydantic import BaseModel
 from scim2_models import AttributeBinding
 from scim2_models import InvalidValueException
@@ -69,9 +71,26 @@ def _read(column: _Column, record: Any) -> Any:
     return _as_scim(value)
 
 
-def _version(mapping: ResourceMapping, record: Any) -> str:
-    """Return the weak ETag of the version of a record."""
-    return f'W/"{getattr(record, mapping.version)}"'
+def _version(mapping: ResourceMapping, record: Any, resource: Resource[Any]) -> str:
+    """Return the weak ETag of the version of a record, from its counter or else from the hash of its resource.
+
+    The hash covers the whole resource but its version, so that any change
+    of the resource changes it, a change of its links included. It covers the
+    values of the write-only attributes too, which the resource does not
+    hold. It is keyed with the SECRET_KEY setting, so that a version tells
+    nothing about these values.
+    """
+    if mapping.version is not None:
+        return f'W/"{getattr(record, mapping.version)}"'
+
+    hidden = {
+        column.binding.urn: repr(getattr(record, column.key))
+        for column in mapping._columns.values()
+        if not column.readable
+    }
+    data = json.dumps([resource.model_dump(mode="json"), hidden], sort_keys=True)
+    digest = salted_hmac("scim2_django.version", data, algorithm="sha256")
+    return f'W/"{digest.hexdigest()[:32]}"'
 
 
 def _to_scim(
@@ -121,11 +140,20 @@ def _to_scim(
     resource.id = str(_read(mapping._id, record))
     resource.meta = Meta(
         resource_type=resource_type,
-        created=_read(mapping._created, record),
-        last_modified=_read(mapping._last_modified, record),
-        version=_version(mapping, record),
+        created=_read_date(mapping._created, record),
+        last_modified=_read_date(mapping._last_modified, record),
     )
-    return model.model_validate(resource.model_dump())
+    resource = model.model_validate(resource.model_dump())
+    resource.meta.version = _version(mapping, record, resource)  # type: ignore[union-attr]
+    return resource
+
+
+def _read_date(column: _Column | None, record: Any) -> Any:
+    """Return a date of a record, or None when the mapping does not store it."""
+    if column is None:
+        return None
+
+    return _read(column, record)
 
 
 def _related(collection: _Collection, record: Any) -> list[Any]:

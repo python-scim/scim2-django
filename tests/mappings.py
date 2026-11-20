@@ -13,7 +13,7 @@ from .models import UserRecord
 ENTERPRISE = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
 
 
-def users_mapping(changes=None):
+def users_mapping(changes=None, version="version"):
     """Return a new mapping of the users, with some paths changed, or removed when None."""
     attributes = {
         "id": "id",
@@ -43,11 +43,11 @@ def users_mapping(changes=None):
         path: value for path, value in attributes.items() if value is not None
     }
     return ResourceMapping(
-        User[EnterpriseUser], UserRecord, attributes, version="version"
+        User[EnterpriseUser], UserRecord, attributes, version=version
     )
 
 
-def groups_mapping(changes=None):
+def groups_mapping(changes=None, version="version"):
     """Return a new mapping of the groups, with some paths changed, or removed when None."""
     attributes = {
         "id": "id",
@@ -64,4 +64,4 @@ def groups_mapping(changes=None):
     attributes = {
         path: value for path, value in attributes.items() if value is not None
     }
-    return ResourceMapping(Group, GroupRecord, attributes, version="version")
+    return ResourceMapping(Group, GroupRecord, attributes, version=version)

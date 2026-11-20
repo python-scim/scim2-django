@@ -33,6 +33,7 @@ class UserRecord(models.Model):
     employee_number = models.TextField(null=True)
     preferred_language = models.TextField()
     badge_number = models.IntegerField(null=True)
+    score = models.FloatField(null=True)
     code = CodeField(null=True)
     manager = models.ForeignKey(
         "self", null=True, on_delete=models.SET_NULL, related_name="reports"
@@ -42,8 +43,8 @@ class UserRecord(models.Model):
         output_field=models.TextField(),
         db_persist=True,
     )
-    created = models.DateTimeField()
-    last_modified = models.DateTimeField()
+    created = models.DateTimeField(null=True)
+    last_modified = models.DateTimeField(null=True)
     version = models.PositiveIntegerField(default=1)
 
 
@@ -93,8 +94,8 @@ class GroupRecord(models.Model):
     subgroups = models.ManyToManyField(
         "self", symmetrical=False, related_name="parents"
     )
-    created = models.DateTimeField()
-    last_modified = models.DateTimeField()
+    created = models.DateTimeField(null=True)
+    last_modified = models.DateTimeField(null=True)
     version = models.PositiveIntegerField(default=1)
 
     class Meta:

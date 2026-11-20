@@ -5,9 +5,8 @@ import pytest
 from django.test import Client
 from django.urls import URLPattern
 from django.urls import URLResolver
-from scim2_server.memory import InMemoryStorage
 
-from examples import scim
+from scim2_django.storage.mapping import _MAPPINGS
 
 
 class URLconf:
@@ -39,9 +38,8 @@ def serve(settings) -> Callable[..., Client]:
 
 
 @pytest.fixture(autouse=True)
-def example_storage() -> Iterator[None]:
-    """Run each test against an example server with no resource."""
-    storage = scim.site.storage
-    scim.site.storage = scim.site.handler.storage = InMemoryStorage()
+def forget_the_mappings() -> Iterator[None]:
+    """Check, in each test, the mappings this test creates only."""
+    _MAPPINGS.clear()
     yield
-    scim.site.storage = scim.site.handler.storage = storage
+    _MAPPINGS.clear()

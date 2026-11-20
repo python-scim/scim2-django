@@ -1,17 +1,15 @@
 import pytest
-from scim2_server.memory import InMemoryStorage
-
-from examples import scim
+from django.db.backends.base.base import BaseDatabaseWrapper
 
 
 @pytest.fixture(autouse=True)
-def example_server(db):
-    """Run each page against an example server with no resource.
+def example_database(db, monkeypatch):
+    """Give each page access to the database of the example server.
 
-    The WSGI handler of Django checks the database connection on each
-    request, so the pages get access to the database.
+    The WSGI handler of Django closes the database connection after each
+    request. The connection is kept open across the requests of a page, so
+    that its test transaction lasts, as the Django test client does.
     """
-    storage = scim.site.storage
-    scim.site.storage = scim.site.handler.storage = InMemoryStorage()
-    yield
-    scim.site.storage = scim.site.handler.storage = storage
+    monkeypatch.setattr(
+        BaseDatabaseWrapper, "close_if_unusable_or_obsolete", lambda self: None
+    )

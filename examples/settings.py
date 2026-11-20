@@ -7,3 +7,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
 ]
+INSTALLED_APPS = ["scim2_django", "examples"]
+DATABASES = {
+    "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "db.sqlite3"},
+}

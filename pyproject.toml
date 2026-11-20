@@ -46,11 +46,13 @@ dev = [
     "django-stubs>=6.1.1",
     "mypy>=2.3.1",
     "prek>=0.5.3",
+    "psycopg[binary]>=3.3.8",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "pytest-django>=4.14.0",
+    "pytest-postgresql>=10.0.0",
     "scim2-client>=0.14.1",
-    "scim2-server[cursor]>=0.8.0",
+    "scim2-server[cursor]>=0.8.1",
     "scim2-tester[testing]>=0.6.4",
     "tox-uv>=1.36.0",
 ]
@@ -130,6 +132,7 @@ env_list = [
     "django60",
     "django61",
     "minversions",
+    "postgresql",
     "doc",
     "coverage",
 ]
@@ -164,6 +167,11 @@ runner = "uv-venv-runner"
 uv_resolution = "lowest-direct"
 package = "editable"
 
+[tool.tox.env.postgresql]
+commands = [
+    ["pytest", "--showlocals", "--full-trace", "--database=postgresql", "{posargs}"],
+]
+
 [tool.tox.env.doc]
 dependency_groups = ["doc"]
 commands = [
@@ -172,6 +180,7 @@ commands = [
 
 [tool.tox.env.coverage]
 commands = [
-    ["pytest", "--cov", "--cov-fail-under=100", "--cov-report", "term:skip-covered", "{posargs}"],
+    ["pytest", "--cov", "--cov-report=", "{posargs}"],
+    ["pytest", "--cov", "--cov-append", "--cov-fail-under=100", "--cov-report", "term:skip-covered", "--database=postgresql", "{posargs}"],
     ["coverage", "html"],
 ]

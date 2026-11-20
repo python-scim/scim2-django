@@ -1,5 +1,6 @@
 import weakref
 from collections.abc import Generator
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -15,7 +16,18 @@ from django.core.exceptions import FieldError
 from django.core.exceptions import ImproperlyConfigured
 from django.db import models
 from django.db.models import CASCADE
+from django.db.models import Exists
+from django.db.models import F
 from django.db.models import ForeignObjectRel
+from django.db.models import Func
+from django.db.models import OuterRef
+from django.db.models import Prefetch
+from django.db.models import Q
+from django.db.models import Value
+from django.db.models.functions import Cast
+from django.db.models.functions import Concat
+from django.db.models.functions import NullIf
+from django.db.models.functions import Substr
 from django.urls import get_resolver
 from pydantic import BaseModel
 from scim2_models import Attribute as SchemaAttribute
@@ -24,12 +36,42 @@ from scim2_models import Mutability
 from scim2_models import Path
 from scim2_models import Required
 from scim2_models import Resource
+from scim2_models import ResponseParameters
 from scim2_models import Schema
 
 _MAPPINGS: "weakref.WeakSet[ResourceMapping]" = weakref.WeakSet()
 """The mappings created so far, which the system check validates."""
 
 _TEXT_FIELDS = (models.CharField, models.TextField)
+
+_UUID_PARTS = ((1, 8), (9, 4), (13, 4), (17, 4), (21, 12))
+
+
+class _UUIDText(Func):
+    """The text of a UUID, with its dashes, as clients read it.
+
+    Databases without a UUID type store it as 32 hexadecimal digits, which
+    a cast to text returns without dashes.
+    """
+
+    output_field = models.TextField()
+
+    def as_sql(  # type: ignore[override]
+        self, compiler: Any, connection: Any, **extra_context: Any
+    ) -> Any:
+        (expression,) = self.get_source_expressions()
+        if connection.features.has_native_uuid_field:
+            return compiler.compile(Cast(expression, models.TextField()))
+
+        parts: list[Any] = []
+        for start, length in _UUID_PARTS:
+            if parts:
+                parts.append(Value("-"))
+
+            parts.append(Substr(expression, start, length))
+
+        text = Concat(*parts, output_field=models.TextField())
+        return compiler.compile(text.resolve_expression(compiler.query))
 
 
 class _Storage(Enum):
@@ -217,6 +259,30 @@ class _Column:
 
         return [value for value, _ in self.field.flatchoices]
 
+    @property
+    def casefolded(self) -> bool:
+        """Whether the values compare without their case."""
+        return self.is_string and not self.binding.case_exact
+
+    @property
+    def compared(self) -> Any:
+        """The expression filters and sorts compare.
+
+        An identifier that is not text is compared as the text clients read.
+        An empty string is no value in a text field without null.
+        """
+        expression = F(self.key) if self.expression is None else self.expression
+        if self.textual and isinstance(self.field, models.UUIDField):
+            return _UUIDText(expression)
+
+        if self.textual:
+            return Cast(expression, models.TextField())
+
+        if self.empty_string:
+            return NullIf(expression, Value(""), output_field=models.TextField())
+
+        return expression
+
 
 @dataclass(eq=False)
 class _Collection:
@@ -278,6 +344,46 @@ class _Collection:
             return self.type_column
 
         return self.columns.get(sub_field_name)
+
+    def entries(self) -> "models.QuerySet[Any]":
+        """Return the entries of the record of the outer query."""
+        return self.entry_model._default_manager.filter(**self._correlation())
+
+    def exists(self, condition: Q | None = None) -> Q:
+        """Return the condition that an entry exists, and matches condition when given."""
+        entries = self.entries()
+        if condition is not None:
+            entries = entries.filter(condition)
+
+        return Q(Exists(entries))
+
+    def _correlation(self) -> dict[str, Any]:
+        """Return the lookup tying the entries to the record of the outer query."""
+        relation: Any = self.relation
+        if isinstance(relation, ForeignObjectRel):
+            field: Any = relation.field
+            if relation.many_to_many:
+                return {field.name: OuterRef("pk")}
+
+            return {field.attname: OuterRef(field.target_field.attname)}
+
+        if relation.many_to_many:
+            return {relation.related_query_name(): OuterRef("pk")}
+
+        return {relation.target_field.attname: OuterRef(relation.attname)}
+
+    def order(self) -> list[Any]:
+        """Return the order of the entries: the one of their default manager, or of their model, or else their primary key."""
+        entries = self.entry_model._default_manager.all()
+        return list(entries.query.order_by or self.entry_model._meta.ordering or ["pk"])
+
+    def prefetch(self) -> "Prefetch[Any]":
+        """Return how to load the entries along with the records, in the order they are read."""
+        entries = self.entry_model._default_manager.order_by(*self.order())
+        if self.target is not None:
+            entries = entries.annotate(**self.target._annotations())
+
+        return Prefetch(self.accessor, queryset=entries)
 
     @property
     def writable(self) -> bool:
@@ -535,6 +641,55 @@ class ResourceMapping:
             for column in self._columns.values()
             if column.binding.urn.lower() == key
         )
+
+    def _sub_columns(self, binding: AttributeBinding) -> list[_Column]:
+        """Return the mapped sub-attributes of a complex attribute holding a single value."""
+        return [
+            column
+            for (model, field_name, sub_field_name), column in self._columns.items()
+            if model is binding.model
+            and field_name == binding.field_name
+            and sub_field_name is not None
+        ]
+
+    def _string_columns(self) -> Iterator[_Column]:
+        """Yield the columns holding strings, those of the collections included."""
+        for column in self._columns.values():
+            if column.is_string:
+                yield column
+
+        for collection in self._all_collections():
+            for column in collection.columns.values():
+                if column.is_string:
+                    yield column
+
+            if collection.type_column is not None:
+                yield collection.type_column
+
+    def _returned_collections(
+        self, parameters: ResponseParameters[Any] | None = None
+    ) -> list[_Collection]:
+        """Return the collections a response keeps, all of them without parameters."""
+        collections = list(self._all_collections())
+        if parameters is None:
+            return collections
+
+        paths = Path[self.model].iter_paths(  # type: ignore[name-defined]
+            include_subattributes=False,
+            attributes=parameters.attributes,
+            excluded_attributes=parameters.excluded_attributes,
+        )
+        bindings = (path.resolve() for path in paths)
+        kept = {binding.urn for binding in bindings if binding is not None}
+        return [
+            collection for collection in collections if collection.binding.urn in kept
+        ]
+
+    def _queryset(self, collections: Iterable[_Collection]) -> "models.QuerySet[Any]":
+        """Return the records with their computed attributes, and the given collections loaded along."""
+        return self.record._default_manager.annotate(
+            **self._annotations()
+        ).prefetch_related(*(collection.prefetch() for collection in collections))
 
     def _annotations(self) -> dict[str, Any]:
         """Return the expressions of the computed attributes, by the alias records hold them under."""

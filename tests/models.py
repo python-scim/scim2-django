@@ -31,6 +31,7 @@ class UserRecord(models.Model):
     active = models.BooleanField(null=True)
     password = models.TextField(null=True)
     employee_number = models.TextField(null=True)
+    preferred_language = models.TextField()
     manager = models.ForeignKey(
         "self", null=True, on_delete=models.SET_NULL, related_name="reports"
     )
@@ -54,6 +55,24 @@ class EmailRecord(models.Model):
 
     class Meta:
         ordering = ["id"]
+
+
+class DescendingManager(models.Manager):
+    """A manager listing the records by descending value."""
+
+    def get_queryset(self):
+        return super().get_queryset().order_by("-value")
+
+
+class PhoneRecord(models.Model):
+    """Entries ordered by their manager, not by their model."""
+
+    user = models.ForeignKey(
+        UserRecord, on_delete=models.CASCADE, related_name="phones"
+    )
+    value = models.TextField()
+
+    objects = DescendingManager()
 
 
 class CertificateRecord(models.Model):

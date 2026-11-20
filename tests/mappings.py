@@ -23,6 +23,7 @@ def users_mapping(changes=None):
         "title": "title",
         "userType": "user_type",
         "nickName": "nick_name",
+        "preferredLanguage": "preferred_language",
         "locale": "lower_name",
         "name.givenName": "given_name",
         "name.familyName": "family_name",

@@ -63,7 +63,8 @@ class _Anchor:
     """The row a cursor page starts after, or ends before.
 
     ties are the values that order the rows sharing a sort value: the
-    identifier as text.
+    identifier as text, preceded at the root by the position of the resource
+    type.
     """
 
     forward: bool
@@ -71,18 +72,25 @@ class _Anchor:
     ties: tuple[Any, ...]
 
 
-def _anchor(position: Any) -> _Anchor | None:
+def _anchor(position: Any, root: bool) -> _Anchor | None:
     """Read the position a storage gave, or return None for the first page."""
     if position is None:
         return None
 
-    if not isinstance(position, dict) or set(position) != {"d", "k", "i"}:
+    names = {"d", "k", "t", "i"} if root else {"d", "k", "i"}
+    if not isinstance(position, dict) or set(position) != names:
         raise InvalidCursorException
 
     if position["d"] not in ("next", "previous") or not isinstance(position["i"], str):
         raise InvalidCursorException
 
     ties: tuple[Any, ...] = (position["i"],)
+    if root:
+        if type(position["t"]) is not int:
+            raise InvalidCursorException
+
+        ties = (position["t"], position["i"])
+
     key = _decode(position["k"])
     if isinstance(key, int) and not isinstance(key, bool) and key not in _INTEGERS:
         raise InvalidCursorException
@@ -95,7 +103,12 @@ def _position(direction: str, key: Any, ties: Sequence[Any]) -> Any:
 
     The sort value is null when the search has no sort.
     """
-    return {"d": direction, "k": _encode(key), "i": ties[-1]}
+    position: dict[str, Any] = {"d": direction, "k": _encode(key)}
+    if len(ties) == 2:
+        position["t"] = ties[0]
+
+    position["i"] = ties[-1]
+    return position
 
 
 def _key_order(key: Any, ascending: bool) -> Any:

@@ -97,6 +97,9 @@ class GroupRecord(models.Model):
     last_modified = models.DateTimeField()
     version = models.PositiveIntegerField(default=1)
 
+    class Meta:
+        ordering = ["display_name"]
+
 
 class BadgeRecord(models.Model):
     """A record outside SCIM, whose user cannot be deleted while it exists."""

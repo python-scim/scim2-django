@@ -7,7 +7,6 @@ from django.db.models import F
 from scim2_models import Group
 from scim2_models import InvalidValueException
 from scim2_models import NotFoundException
-from scim2_models import NotImplementedException
 from scim2_models import PreconditionFailedException
 from scim2_models import ResourceType
 from scim2_models import ScimPolicy
@@ -78,12 +77,6 @@ def test_a_search_on_no_resource_type_finds_nothing(server):
     page = server.storage.search([], SearchRequest())
 
     assert (page.total, page.resources) == (0, [])
-
-
-def test_a_search_at_the_root_is_not_implemented(server):
-    """Searching several resource types at once comes with the cursors."""
-    with pytest.raises(NotImplementedException):
-        server.storage.search([server.users, server.groups], SearchRequest())
 
 
 def test_an_identifier_the_field_cannot_hold_is_not_found(server):

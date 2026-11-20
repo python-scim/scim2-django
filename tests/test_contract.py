@@ -10,8 +10,6 @@ pytestmark = pytest.mark.django_db
 
 
 class TestDjangoStorage(ScimStorageContract):
-    supports_root_search = False
-
     @pytest.fixture
     def storage(self, provider):
         mappings = {"User": users_mapping(), "Group": groups_mapping()}

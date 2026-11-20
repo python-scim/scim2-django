@@ -23,3 +23,5 @@ Added
 - ``manage.py check`` checks the fields of every mapping.
 - ``meta.created`` and ``meta.lastModified`` are optional in a mapping. Without them, the
   resources have no such date.
+- The version field is optional in a mapping. Without it, ``meta.version`` is a hash of the whole
+  resource, which changes with any change of the resource, its links included.

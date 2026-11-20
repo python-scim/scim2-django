@@ -28,19 +28,19 @@ a name, an employee number, email addresses and teams:
    :language: python
    :pyobject: Account
 
-The models need two things for SCIM:
+The models need a primary key unique across the accounts and the teams, here a UUID. Per
+:rfc:`RFC 7643 §3.1 <7643#section-3.1>`, two resources never share an ``id``, even of different
+types.
 
-- a primary key unique across the accounts and the teams, here a UUID.
-  Per :rfc:`RFC 7643 §3.1 <7643#section-3.1>`, two resources never share an ``id``, even of
-  different types;
-- an integer field counting the writes, here ``revision``. The storage increments it on every
-  write, and SCIM clients send it back in their ``If-Match`` headers.
-
-Two more fields serve SCIM, and the models can do without them:
+Four more fields serve SCIM, and the models can do without them:
 
 - a field for the identifier the identity provider gives, here ``external_id``;
 - a creation date and a modification date, here ``created_at`` and ``updated_at``. Without
-  them, the resources have no ``meta.created`` and no ``meta.lastModified``.
+  them, the resources have no ``meta.created`` and no ``meta.lastModified``;
+- an integer field counting the writes, here ``revision``. The storage increments it on every
+  write, and SCIM clients send the version back in their ``If-Match`` headers. Without it, the
+  version is a hash of the whole resource. The storage then reads every collection of a
+  resource, such as all the members of a group, even when a response leaves them out.
 
 The email addresses and the teams live in models of their own:
 

@@ -27,3 +27,19 @@ class TestDjangoStorageWithoutDates(ScimStorageContract):
         undated = {"meta.created": None, "meta.lastModified": None}
         mappings = {"User": users_mapping(undated), "Group": groups_mapping(undated)}
         return DjangoStorage(mappings, provider)
+
+
+class TestDjangoStorageWithHashes(ScimStorageContract):
+    """Resources whose models have neither a version field nor dates."""
+
+    stores_created = False
+    stores_last_modified = False
+
+    @pytest.fixture
+    def storage(self, provider):
+        undated = {"meta.created": None, "meta.lastModified": None}
+        mappings = {
+            "User": users_mapping(undated, version=None),
+            "Group": groups_mapping(undated, version=None),
+        }
+        return DjangoStorage(mappings, provider)

@@ -24,7 +24,10 @@ from .test_storage import Server
 
 pytestmark = pytest.mark.django_db
 
+NOW = datetime.datetime(2026, 11, 20, 8, 0, tzinfo=datetime.UTC)
+
 RANKED = "urn:example:params:scim:schemas:extension:ranked:2.0:User"
+WEIGHTED = "urn:example:params:scim:schemas:extension:weighted:2.0:User"
 
 
 class Ranked(Extension):
@@ -384,26 +387,92 @@ def test_cursors_page_on_the_values_the_database_compares():
     assert user_names(pages) == ["a", "b", "c"]
 
 
-def test_a_sort_on_fields_of_different_types_is_refused_at_the_root():
-    """The sort values of every resource type fit in one column, of one type."""
-    storage = DjangoStorage(
-        {"User": ranked_mapping("badge_number"), "Robot": ranked_mapping("version")}
+def robots():
+    """Return a resource type of ranked users, other than User."""
+    return ResourceType(
+        id="Robot",
+        name="Robot",
+        endpoint="/Robots",
+        schema_=User.__schema__,
+        schema_extensions=ResourceType.from_resource(User[Ranked]).schema_extensions,
     )
+
+
+def test_a_sort_on_fields_of_different_types_is_refused_at_the_root():
+    """The sort values of every resource type fit in one column: numbers, or text, not both."""
+    storage = DjangoStorage(
+        {"User": ranked_mapping("badge_number"), "Robot": ranked_mapping("user_name")}
+    )
+    resource_types = [ResourceType.from_resource(User[Ranked]), robots()]
+
+    with pytest.raises(InvalidPathException, match="different types"):
+        storage.search(resource_types, SearchRequest(sort_by=f"{RANKED}:rank"))
+
+
+class Weighted(Extension):
+    __schema__ = URN(WEIGHTED)
+
+    weight: float | None = None
+
+
+def weighted_mapping(field):
+    """Return a mapping of the users with a weight, stored in a field."""
+    return ResourceMapping(
+        User[Weighted],
+        UserRecord,
+        {
+            "id": "id",
+            "userName": "user_name",
+            f"{WEIGHTED}:weight": field,
+            "meta.created": "created",
+            "meta.lastModified": "last_modified",
+        },
+        version="version",
+    )
+
+
+def test_cursors_page_at_the_root_on_integers_and_floats():
+    """An integer field and a float field sort together, and each anchor keeps the value of its row."""
+    storage = DjangoStorage(
+        {"User": weighted_mapping("badge_number"), "Robot": weighted_mapping("score")}
+    )
+    extensions = ResourceType.from_resource(User[Weighted]).schema_extensions
     resource_types = [
-        ResourceType.from_resource(User[Ranked]),
+        ResourceType.from_resource(User[Weighted]),
         ResourceType(
             id="Robot",
             name="Robot",
             endpoint="/Robots",
             schema_=User.__schema__,
-            schema_extensions=ResourceType.from_resource(
-                User[Ranked]
-            ).schema_extensions,
+            schema_extensions=extensions,
         ),
     ]
+    UserRecord.objects.create(
+        user_name="a", badge_number=1, score=1.5, created=NOW, last_modified=NOW
+    )
+    UserRecord.objects.create(
+        user_name="b", badge_number=2, created=NOW, last_modified=NOW
+    )
+    search_request = SearchRequest(cursor="", count=1, sort_by=f"{WEIGHTED}:weight")
 
-    with pytest.raises(InvalidPathException, match="different types"):
-        storage.search(resource_types, SearchRequest(sort_by=f"{RANKED}:rank"))
+    pages = walk(storage, resource_types, search_request)
+
+    assert [
+        (r.meta.resource_type, r.user_name) for page in pages for r in page.resources
+    ] == [("User", "a"), ("Robot", "a"), ("User", "b"), ("Robot", "b")]
+
+
+def test_a_root_anchor_with_a_sort_value_needs_a_type_with_a_sort_key(mixed):
+    """Groups have no userName, so no position of theirs holds a userName."""
+    server, resource_types = mixed
+    position = {"d": "next", "k": "a", "t": 1, "i": "x"}
+
+    with pytest.raises(InvalidCursorException):
+        server.storage.search(
+            resource_types,
+            SearchRequest(cursor="x", sort_by="userName"),
+            position=position,
+        )
 
 
 def test_a_page_at_the_root_loads_its_records_in_batches(mixed, monkeypatch):

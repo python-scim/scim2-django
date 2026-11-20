@@ -33,6 +33,7 @@ class UserRecord(models.Model):
     employee_number = models.TextField(null=True)
     preferred_language = models.TextField()
     badge_number = models.IntegerField(null=True)
+    score = models.FloatField(null=True)
     code = CodeField(null=True)
     manager = models.ForeignKey(
         "self", null=True, on_delete=models.SET_NULL, related_name="reports"

@@ -21,6 +21,9 @@ Added
   exact. The storage searches one resource type, or several at the root of the server. It pages
   by index, or with cursors that give stable pages (:rfc:`RFC 9865 <9865>`).
 - ``manage.py check`` checks the fields of every mapping.
+- An attribute can be stored in a model related by a reverse one-to-one relation, such as a table
+  beside the users, with a path such as ``"scim__external_id"``. The storage creates the related
+  record at its first value.
 - ``meta.created`` and ``meta.lastModified`` are optional in a mapping. Without them, the
   resources have no such date.
 - The version field is optional in a mapping. Without it, ``meta.version`` is a hash of the whole

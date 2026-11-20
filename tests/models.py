@@ -48,6 +48,39 @@ class UserRecord(models.Model):
     version = models.PositiveIntegerField(default=1)
 
 
+class UserScim(models.Model):
+    """A table beside the users, holding what SCIM adds to them."""
+
+    user = models.OneToOneField(
+        UserRecord, on_delete=models.CASCADE, primary_key=True, related_name="scim"
+    )
+    external_id = models.TextField(null=True)
+    division = models.TextField(blank=True)
+    level = models.IntegerField(default=0)
+
+
+class UserCard(models.Model):
+    """A table beside the users that cannot be created without a number."""
+
+    user = models.OneToOneField(
+        UserRecord, on_delete=models.CASCADE, related_name="card"
+    )
+    number = models.IntegerField()
+    note = models.TextField(null=True)
+
+
+class UserBadge(models.Model):
+    """A table beside the users, queried by another name than its accessor."""
+
+    user = models.OneToOneField(
+        UserRecord,
+        on_delete=models.CASCADE,
+        related_name="badge",
+        related_query_name="badge_record",
+    )
+    label = models.TextField(null=True)
+
+
 class EmailRecord(models.Model):
     user = models.ForeignKey(
         UserRecord, on_delete=models.CASCADE, related_name="emails"

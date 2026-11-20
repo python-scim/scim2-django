@@ -3,6 +3,7 @@ from scim2_server.testing import ScimStorageContract
 
 from scim2_django.storage import DjangoStorage
 
+from .mappings import ENTERPRISE
 from .mappings import groups_mapping
 from .mappings import users_mapping
 
@@ -42,4 +43,17 @@ class TestDjangoStorageWithHashes(ScimStorageContract):
             "User": users_mapping(undated, version=None),
             "Group": groups_mapping(undated, version=None),
         }
+        return DjangoStorage(mappings, provider)
+
+
+class TestDjangoStorageWithRelatedFields(ScimStorageContract):
+    """Users whose externalId and division are in a table beside them."""
+
+    @pytest.fixture
+    def storage(self, provider):
+        beside = {
+            "externalId": "scim__external_id",
+            f"{ENTERPRISE}:division": "scim__division",
+        }
+        mappings = {"User": users_mapping(beside), "Group": groups_mapping()}
         return DjangoStorage(mappings, provider)

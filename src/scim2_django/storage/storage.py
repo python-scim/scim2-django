@@ -274,8 +274,10 @@ class DjangoStorage(ScimStorage):
             links = self._links(mapping, resource)
             record = mapping.record()
             now = _now()
-            setattr(record, mapping._created.key, now)
-            setattr(record, mapping._last_modified.key, now)
+            for column in (mapping._created, mapping._last_modified):
+                if column is not None:
+                    setattr(record, column.key, now)
+
             _from_scim(mapping, resource, record, links, creating=True)
             self._save(mapping, resource, record, links, None)
 
@@ -304,7 +306,9 @@ class DjangoStorage(ScimStorage):
             links = self._links(mapping, resource)
             self._count_write(mapping, record)
             _from_scim(mapping, resource, record, links, creating=False)
-            setattr(record, mapping._last_modified.key, _now())
+            if mapping._last_modified is not None:
+                setattr(record, mapping._last_modified.key, _now())
+
             self._save(mapping, resource, record, links, stored)
 
         return self.get(resource_type, resource.id)  # type: ignore[arg-type]

@@ -121,11 +121,19 @@ def _to_scim(
     resource.id = str(_read(mapping._id, record))
     resource.meta = Meta(
         resource_type=resource_type,
-        created=_read(mapping._created, record),
-        last_modified=_read(mapping._last_modified, record),
+        created=_read_date(mapping._created, record),
+        last_modified=_read_date(mapping._last_modified, record),
         version=_version(mapping, record),
     )
     return model.model_validate(resource.model_dump())
+
+
+def _read_date(column: _Column | None, record: Any) -> Any:
+    """Return a date of a record, or None when the mapping does not store it."""
+    if column is None:
+        return None
+
+    return _read(column, record)
 
 
 def _related(collection: _Collection, record: Any) -> list[Any]:

@@ -91,13 +91,25 @@ def error_ids(mapping):
     return [message.id for message in mapping.check()]
 
 
-@pytest.mark.parametrize("missing", ["id", "meta.created", "meta.lastModified"])
-def test_a_mapping_needs_the_identifier_and_the_dates(missing):
-    """The storage fills these attributes, so it needs a field for each."""
-    attributes = {key: value for key, value in REQUIRED.items() if key != missing}
+def test_a_mapping_needs_the_identifier():
+    """A resource without id could not be found again."""
+    attributes = {key: value for key, value in REQUIRED.items() if key != "id"}
 
-    with pytest.raises(ValueError, match=missing):
+    with pytest.raises(ValueError, match="'id'"):
         ResourceMapping(User, Person, attributes, version="version")
+
+
+@pytest.mark.parametrize(
+    "dates", [["meta.created"], ["meta.created", "meta.lastModified"]]
+)
+def test_a_mapping_can_leave_out_the_dates(dates):
+    """The resources then have no such date, and the check accepts the mapping."""
+    attributes = {key: value for key, value in REQUIRED.items() if key not in dates}
+
+    mapping = ResourceMapping(User, Person, attributes, version="version")
+
+    assert error_ids(mapping) == []
+    assert mapping._created is None
 
 
 def test_an_unknown_path_is_refused():

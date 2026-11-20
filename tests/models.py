@@ -43,8 +43,8 @@ class UserRecord(models.Model):
         output_field=models.TextField(),
         db_persist=True,
     )
-    created = models.DateTimeField()
-    last_modified = models.DateTimeField()
+    created = models.DateTimeField(null=True)
+    last_modified = models.DateTimeField(null=True)
     version = models.PositiveIntegerField(default=1)
 
 
@@ -94,8 +94,8 @@ class GroupRecord(models.Model):
     subgroups = models.ManyToManyField(
         "self", symmetrical=False, related_name="parents"
     )
-    created = models.DateTimeField()
-    last_modified = models.DateTimeField()
+    created = models.DateTimeField(null=True)
+    last_modified = models.DateTimeField(null=True)
     version = models.PositiveIntegerField(default=1)
 
     class Meta:

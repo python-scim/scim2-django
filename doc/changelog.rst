@@ -21,3 +21,5 @@ Added
   exact. The storage searches one resource type, or several at the root of the server. It pages
   by index, or with cursors that give stable pages (:rfc:`RFC 9865 <9865>`).
 - ``manage.py check`` checks the fields of every mapping.
+- ``meta.created`` and ``meta.lastModified`` are optional in a mapping. Without them, the
+  resources have no such date.

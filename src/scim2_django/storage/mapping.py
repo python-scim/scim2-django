@@ -417,8 +417,9 @@ class ResourceMapping:
     :param record: The Django model of the records.
     :param attributes: The attributes, by SCIM path. A value is the name of a
         field, an :class:`Attribute`, a :class:`Computed`, a :class:`Many`, a
-        :class:`Link`, or a list of :class:`Link`. ``id``, ``meta.created``
-        and ``meta.lastModified`` are required.
+        :class:`Link`, or a list of :class:`Link`. ``id`` is required.
+        ``meta.created`` and ``meta.lastModified`` are filled by the storage:
+        without them, the resources have no such date.
     :param version: The name of an integer field counting the writes of each
         record, which gives ``meta.version``. A write changes the version of
         the written resource only: adding a member to a group changes the
@@ -428,7 +429,9 @@ class ResourceMapping:
         value does not fit the attribute of its path.
     """
 
-    _REQUIRED = ("id", "meta.created", "meta.lastModified")
+    _REQUIRED = ("id",)
+    _FIELDS = ("id", "meta.created", "meta.lastModified")
+    """The attributes the storage fills itself, which a field holds as it is."""
 
     def __init__(
         self,
@@ -857,8 +860,8 @@ class ResourceMapping:
 
         self._check_value(path, binding)
         self._check_field_value(path, value)
-        required = {_key(self._resolve(path)) for path in self._REQUIRED}
-        if _key(binding) in required and not isinstance(value, str):
+        fields = {_key(self._resolve(path)) for path in self._FIELDS}
+        if _key(binding) in fields and not isinstance(value, str):
             raise ValueError(f"{path!r} must be mapped to the name of a field")
 
         self._declared[path] = (binding, value)
@@ -962,13 +965,17 @@ class ResourceMapping:
 
         self._id = self._column("id")
         self._id.textual = not isinstance(self._id.field, _TEXT_FIELDS)
-        self._created = self._column("meta.created")
-        self._last_modified = self._column("meta.lastModified")
+        self._created = self._columns.get(_key(self._resolve("meta.created")))
+        self._last_modified = self._columns.get(
+            _key(self._resolve("meta.lastModified"))
+        )
         for path, column in (
             ("meta.created", self._created),
             ("meta.lastModified", self._last_modified),
         ):
-            if not isinstance(column.field, models.DateTimeField):
+            if column is not None and not isinstance(
+                column.field, models.DateTimeField
+            ):
                 yield self._error(
                     f"{path!r} must be mapped to a date and time field",
                     "scim2_django.E006",

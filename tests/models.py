@@ -32,6 +32,8 @@ class UserRecord(models.Model):
     password = models.TextField(null=True)
     employee_number = models.TextField(null=True)
     preferred_language = models.TextField()
+    badge_number = models.IntegerField(null=True)
+    code = CodeField(null=True)
     manager = models.ForeignKey(
         "self", null=True, on_delete=models.SET_NULL, related_name="reports"
     )
@@ -107,6 +109,7 @@ class Person(models.Model):
 
     id = models.TextField(primary_key=True)
     user_name = models.TextField()
+    serial = models.TextField(unique=True, null=True)
     data = models.JSONField(null=True)
     code = CodeField(null=True)
     status = models.TextField(default="new")

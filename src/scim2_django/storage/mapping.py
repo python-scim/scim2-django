@@ -967,11 +967,13 @@ class ResourceMapping:
                     "scim2_django.E006",
                 )
 
-        if self._id.field is None or not (
-            self._id.field.primary_key or self._id.field.unique
+        field = self._id.field
+        if field is None or not (
+            field.primary_key or (field.unique and not field.null)
         ):
             yield self._error(
-                "'id' must be mapped to the primary key, or to a unique field",
+                "'id' must be mapped to the primary key, or to a unique field "
+                "without null",
                 "scim2_django.E005",
             )
 

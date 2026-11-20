@@ -1,3 +1,4 @@
+import dataclasses
 import operator
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -8,6 +9,7 @@ from django.core.exceptions import ValidationError
 from django.db import DEFAULT_DB_ALIAS
 from django.db import models
 from django.db.models import BooleanField
+from django.db.models import ExpressionWrapper
 from django.db.models import Q
 from django.db.models import Subquery
 from django.db.models import Value
@@ -18,6 +20,7 @@ from django.db.models.lookups import IsNull
 from django.db.models.lookups import LessThan
 from django.db.models.lookups import LessThanOrEqual
 from scim2_models import AttributeBinding
+from scim2_models import InvalidCursorException
 from scim2_models import InvalidFilterException
 from scim2_models import InvalidPathException
 from scim2_models import ScimFilter
@@ -36,6 +39,9 @@ from scim2_models.path import coerce_value
 from .comparison import _SUBSTRINGS
 from .comparison import _Comparator
 from .conversion import _as_stored
+from .keyset import _Anchor
+from .keyset import _beyond
+from .keyset import _keyset_order
 from .mapping import ResourceMapping
 from .mapping import _Collection
 from .mapping import _Column
@@ -400,7 +406,10 @@ def _sort_key(
 
     expression: Any = column.compared
     if column.is_string:
-        expression = comparator.column(column)
+        # The text the database sorts on, without the conversion of a field.
+        expression = ExpressionWrapper(
+            comparator.column(column), output_field=models.TextField()
+        )
 
     if collection is None:
         return expression
@@ -442,29 +451,72 @@ def _search(
     search_request: SearchRequest[Any],
     comparator: _Comparator,
     using: str = DEFAULT_DB_ALIAS,
+    anchor: _Anchor | None = None,
 ) -> tuple["models.QuerySet[Any]", "models.QuerySet[Any]"]:
     """Return the matching records, and the page of them a search asks for.
 
-    The records are ordered by sort value, then by primary key: without the
-    key, records sharing a sort value could change pages from a request to
-    the next. Per RFC 7644 §3.4.2.3, records without a value come last when
-    ascending and first when descending.
+    The records are ordered by sort value, then by identifier: without the
+    identifier, records sharing a sort value could change pages from a
+    request to the next. Per RFC 7644 §3.4.2.3, records without a value come
+    last when ascending and first when descending. Each record of the page
+    holds its sort value under the scim_sort_key attribute, when the search
+    sorts.
+
+    A cursor page is read from the anchor, in the reverse order for a
+    previous page, and holds count + 1 records at most: the last one tells
+    whether a page follows.
     """
     condition = _where(mapping, search_request, comparator)
     matching = mapping.record._default_manager.using(using).filter(condition)
-    key = _sort_key(mapping, search_request, comparator)
-    order: list[Any] = []
-    if key is not None:
-        descending = search_request.sort_order == SearchRequest.SortOrder.descending
-        order.append(
-            key.desc(nulls_first=True) if descending else key.asc(nulls_last=True)
-        )
-
     collections = mapping._returned_collections(search_request)
     page = mapping._queryset(collections, using).filter(condition)
-    page = page.order_by(*order, "pk")
-    start = search_request.start_index_0 or 0
-    if search_request.count is None:
-        return matching, page[start:]
+    key = _sort_key(mapping, search_request, comparator)
+    if key is not None:
+        page = page.annotate(scim_sort_key=key)
+        key = models.F("scim_sort_key")
 
-    return matching, page[start : start + search_request.count]
+    tie = models.F(mapping._id.key)
+    descending = search_request.sort_order == SearchRequest.SortOrder.descending
+    forward = anchor is None or anchor.forward
+    page = page.order_by(*_keyset_order(key, [tie], descending, forward))
+    if search_request.cursor is None:
+        start = search_request.start_index_0 or 0
+        if search_request.count is None:
+            return matching, page[start:]
+
+        return matching, page[start : start + search_request.count]
+
+    if anchor is not None:
+        if key is not None:
+            anchor = _sort_anchor(page, anchor)
+
+        value = _as_key(mapping._id, anchor.ties[0])
+        if value is None:
+            raise InvalidCursorException
+
+        lookup = "gt" if anchor.forward else "lt"
+        tie_after = Q(**{f"{mapping._id.key}__{lookup}": value})
+        page = page.filter(_beyond(key, tie_after, anchor, descending))
+
+    if search_request.count is None:
+        return matching, page
+
+    return matching, page[: search_request.count + 1]
+
+
+def _sort_anchor(page: "models.QuerySet[Any]", anchor: _Anchor) -> _Anchor:
+    """Return an anchor whose sort value has the type of the sort key of a page.
+
+    A sort value the key cannot hold, such as a text on an integer field
+    since the mapping changed, raises InvalidCursorException.
+    """
+    if anchor.key is None:
+        return anchor
+
+    output = page.query.annotations["scim_sort_key"].output_field
+    try:
+        key = output.to_python(anchor.key)
+    except (ValidationError, TypeError, ValueError):
+        raise InvalidCursorException from None
+
+    return dataclasses.replace(anchor, key=key)

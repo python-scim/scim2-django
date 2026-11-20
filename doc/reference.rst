@@ -66,7 +66,7 @@ The checks report the following errors and warnings:
    * - ``scim2_django.E004``
      - The version is not an integer field.
    * - ``scim2_django.E005``
-     - ``id`` is mapped to a field that is neither the primary key nor unique.
+     - ``id`` is mapped to a field that is neither the primary key nor unique without null.
    * - ``scim2_django.E006``
      - ``meta.created`` or ``meta.lastModified`` is mapped to a field that is not a
        :class:`~django.db.models.DateTimeField`.

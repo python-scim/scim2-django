@@ -40,7 +40,7 @@ def strict_key(binding, value):
 class Server:
     """A storage of the users and the groups, with its resource types and models."""
 
-    def __init__(self, storage_class=DjangoStorage, policy=None):
+    def __init__(self, storage_class=DjangoStorage, policy=None, mappings=None):
         provider = load_default_provider()
         if policy is not None:
             provider = ScimProvider.from_discovery(
@@ -54,7 +54,9 @@ class Server:
         self.groups = next(rt for rt in provider.resource_types if rt.id == "Group")
         self.user_model = provider.model_for(self.users)
         self.group_model = provider.model_for(self.groups)
-        mappings = {"User": users_mapping(), "Group": groups_mapping()}
+        mappings = {"User": users_mapping(), "Group": groups_mapping()} | (
+            mappings or {}
+        )
         self.storage = storage_class(mappings, provider)
 
     def create_user(self, user_name):

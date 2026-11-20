@@ -14,6 +14,7 @@ from django.core import checks
 from django.core.exceptions import FieldDoesNotExist
 from django.core.exceptions import FieldError
 from django.core.exceptions import ImproperlyConfigured
+from django.db import DEFAULT_DB_ALIAS
 from django.db import models
 from django.db.models import CASCADE
 from django.db.models import Exists
@@ -38,6 +39,7 @@ from scim2_models import Required
 from scim2_models import Resource
 from scim2_models import ResponseParameters
 from scim2_models import Schema
+from scim2_models import Uniqueness
 
 _MAPPINGS: "weakref.WeakSet[ResourceMapping]" = weakref.WeakSet()
 """The mappings created so far, which the system check validates."""
@@ -418,7 +420,10 @@ class ResourceMapping:
         :class:`Link`, or a list of :class:`Link`. ``id``, ``meta.created``
         and ``meta.lastModified`` are required.
     :param version: The name of an integer field counting the writes of each
-        record, which gives ``meta.version``.
+        record, which gives ``meta.version``. A write changes the version of
+        the written resource only: adding a member to a group changes the
+        version of the group, not the one of the user, although the
+        ``groups`` of the user change.
     :raises ValueError: When a path is not valid for the model, or when a
         value does not fit the attribute of its path.
     """
@@ -666,6 +671,15 @@ class ResourceMapping:
             if collection.type_column is not None:
                 yield collection.type_column
 
+    def _unique_columns(self) -> Iterator[_Column]:
+        """Yield the readable columns whose values no two resources share."""
+        for column in self._columns.values():
+            if column.readable and column.binding.get_annotation(Uniqueness) in (
+                Uniqueness.server,
+                Uniqueness.global_,
+            ):
+                yield column
+
     def _returned_collections(
         self, parameters: ResponseParameters[Any] | None = None
     ) -> list[_Collection]:
@@ -685,11 +699,14 @@ class ResourceMapping:
             collection for collection in collections if collection.binding.urn in kept
         ]
 
-    def _queryset(self, collections: Iterable[_Collection]) -> "models.QuerySet[Any]":
-        """Return the records with their computed attributes, and the given collections loaded along."""
-        return self.record._default_manager.annotate(
-            **self._annotations()
-        ).prefetch_related(*(collection.prefetch() for collection in collections))
+    def _queryset(
+        self, collections: Iterable[_Collection], using: str = DEFAULT_DB_ALIAS
+    ) -> "models.QuerySet[Any]":
+        """Return the records of a database with their computed attributes, and the given collections loaded along."""
+        records = self.record._default_manager.using(using)
+        return records.annotate(**self._annotations()).prefetch_related(
+            *(collection.prefetch() for collection in collections)
+        )
 
     def _annotations(self) -> dict[str, Any]:
         """Return the expressions of the computed attributes, by the alias records hold them under."""

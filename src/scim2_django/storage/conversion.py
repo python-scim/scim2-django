@@ -233,7 +233,8 @@ def _write_collections(
         if collection.owned:
             getattr(record, collection.accessor).all().delete()
             entries = Path(collection.binding.urn).get(resource, strict=False) or []
-            collection.entry_model.objects.bulk_create(
+            entry_records = collection.entry_model._base_manager.using(record._state.db)
+            entry_records.bulk_create(
                 [_write_entry(collection, entry, record) for entry in entries]
             )
         elif not collection.single:

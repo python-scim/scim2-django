@@ -6,10 +6,14 @@ Serve a SCIM 2.0 server from a [Django](https://www.djangoproject.com/) project,
 [RFC7643](https://datatracker.ietf.org/doc/html/rfc7643) and
 [RFC7644](https://datatracker.ietf.org/doc/html/rfc7644) define it. It is built upon
 [scim2-server](https://scim2-server.readthedocs.io/) and
-[scim2-models](https://scim2-models.readthedocs.io/). Your project provides the storage.
+[scim2-models](https://scim2-models.readthedocs.io/). It stores the resources in the models of
+your project.
 
 ## Features
 
+- Storage in the models of your project, with filters, sorts and pages run in the database,
+  on SQLite and PostgreSQL
+- `manage.py check` checks the mappings between SCIM attributes and model fields
 - Resource endpoints: `POST`, `GET`, `PUT`, `PATCH` and `DELETE`, for every resource type
 - Search: `GET` and `POST /.search`, per resource type and at the server root
 - Discovery endpoints: `/ServiceProviderConfig`, `/ResourceTypes` and `/Schemas`
@@ -25,19 +29,34 @@ Serve a SCIM 2.0 server from a [Django](https://www.djangoproject.com/) project,
 ```python
 # urls.py
 from django.urls import path
-from scim2_models import ScimProvider, User
-from scim2_server.storage import ScimStorage
+from scim2_models import ResourceType, ScimProvider, User
 
 from scim2_django import ScimSite
+from scim2_django.storage import DjangoStorage, ResourceMapping
 
+from accounts.models import Account
 
-class MyStorage(ScimStorage): ...
+USERS = ResourceMapping(
+    User,
+    Account,
+    {
+        "id": "id",
+        "userName": "login",
+        "meta.created": "created_at",
+        "meta.lastModified": "updated_at",
+    },
+    version="revision",
+)
 
 
 def authenticate(request): ...
 
 
-site = ScimSite(MyStorage(), ScimProvider(models=[User]), authenticate=authenticate)
+provider = ScimProvider.from_discovery(
+    USERS.schemas(), [ResourceType.from_resource(User)]
+)
+storage = DjangoStorage({"User": USERS}, provider)
+site = ScimSite(storage, provider, authenticate=authenticate)
 
 urlpatterns = [
     path("scim/v2/", site.urls),
@@ -52,11 +71,12 @@ pip install scim2-django
 
 ## Documentation
 
-- [Overview](https://scim2-django.readthedocs.io/en/latest/overview.html) introduces the parts
-  of a SCIM server built with Django.
+- [Overview](https://scim2-django.readthedocs.io/en/latest/overview.html) builds a SCIM server
+  over the models of an existing project.
 - [How-to guides](https://scim2-django.readthedocs.io/en/latest/how-to/index.html) cover
   authentication, URLs, reverse proxies, request sizes and transactions.
-- [Reference](https://scim2-django.readthedocs.io/en/latest/reference.html) lists the public API.
+- [Reference](https://scim2-django.readthedocs.io/en/latest/reference.html) lists the public API
+  and the system checks.
 
 ## What's SCIM anyway?
 

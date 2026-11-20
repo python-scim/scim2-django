@@ -5,6 +5,7 @@ from functools import reduce
 from typing import Any
 
 from django.core.exceptions import ValidationError
+from django.db import DEFAULT_DB_ALIAS
 from django.db import models
 from django.db.models import BooleanField
 from django.db.models import Q
@@ -440,6 +441,7 @@ def _search(
     mapping: ResourceMapping,
     search_request: SearchRequest[Any],
     comparator: _Comparator,
+    using: str = DEFAULT_DB_ALIAS,
 ) -> tuple["models.QuerySet[Any]", "models.QuerySet[Any]"]:
     """Return the matching records, and the page of them a search asks for.
 
@@ -449,7 +451,7 @@ def _search(
     ascending and first when descending.
     """
     condition = _where(mapping, search_request, comparator)
-    matching = mapping.record._default_manager.filter(condition)
+    matching = mapping.record._default_manager.using(using).filter(condition)
     key = _sort_key(mapping, search_request, comparator)
     order: list[Any] = []
     if key is not None:
@@ -459,7 +461,8 @@ def _search(
         )
 
     collections = mapping._returned_collections(search_request)
-    page = mapping._queryset(collections).filter(condition).order_by(*order, "pk")
+    page = mapping._queryset(collections, using).filter(condition)
+    page = page.order_by(*order, "pk")
     start = search_request.start_index_0 or 0
     if search_request.count is None:
         return matching, page[start:]

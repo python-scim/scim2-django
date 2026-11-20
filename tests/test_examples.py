@@ -1,7 +1,10 @@
+import pytest
+
 SCIM_JSON = "application/scim+json"
 ENTERPRISE_SCHEMA = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
 
 
+@pytest.mark.django_db
 def test_example_server_creates_and_reads_a_user(client):
     """Create a user with the enterprise extension on the example server, and read it back."""
     user_payload = {

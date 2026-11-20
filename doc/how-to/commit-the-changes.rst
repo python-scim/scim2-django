@@ -4,6 +4,7 @@ Commit the changes
 Use this guide to tie the changes of each SCIM operation to a database transaction. It addresses
 developers who write a :class:`~scim2_server.storage.ScimStorage` upon the database of a Django
 project. To write the storage itself, read :doc:`scim2_server:how-to/write-a-storage`.
+:class:`~scim2_django.storage.DjangoStorage` already encloses each operation in a transaction.
 
 The site never opens a transaction, and never commits. It encloses each SCIM operation in the
 :meth:`~scim2_server.storage.ScimStorage.operation` context manager of the storage. An

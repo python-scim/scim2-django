@@ -1,9 +1,9 @@
 Reference
 =========
 
-This reference describes the public scim2-django API and the URL names of the SCIM endpoints.
-The :doc:`scim2-server reference <scim2_server:reference/index>` describes the storage contract,
-the service and the other classes the site relies on.
+This reference describes the public scim2-django API, the URL names of the SCIM endpoints and the
+system checks of the mappings. The :doc:`scim2-server reference <scim2_server:reference/index>`
+describes the storage contract, the service and the other classes the site relies on.
 
 Site
 ----
@@ -12,6 +12,77 @@ The SCIM server, to include in the URLconf of a project.
 
 .. autoclass:: scim2_django.ScimSite
    :members: urls, get_urls, authenticate, read_request, read_body, serve
+
+.. _storage-reference:
+
+Storage
+-------
+
+The storage of the resources in the models of a project, and the mappings between SCIM models
+and Django models.
+
+.. autoclass:: scim2_django.storage.DjangoStorage
+   :members: operation, get, search, create, update, delete
+
+.. autoclass:: scim2_django.storage.ResourceMapping
+   :members: schemas, check
+
+.. autoclass:: scim2_django.storage.Attribute
+
+.. autoclass:: scim2_django.storage.Computed
+
+.. autoclass:: scim2_django.storage.Many
+
+.. autoclass:: scim2_django.storage.Link
+
+.. _system-checks:
+
+System checks
+-------------
+
+With ``scim2_django`` in :setting:`INSTALLED_APPS`, the :doc:`system check framework
+<django:topics/checks>` checks the fields of every :class:`~scim2_django.storage.ResourceMapping`
+once the URLconf is loaded. A storage refuses to serve a mapping with errors, and raises
+:class:`~django.core.exceptions.ImproperlyConfigured`.
+
+The checks report the following errors and warnings:
+
+.. list-table::
+   :header-rows: 1
+
+   * - ID
+     - Reported when
+   * - ``scim2_django.E001``
+     - An attribute, or the version, is mapped to a name that is not a field of the model.
+   * - ``scim2_django.E002``
+     - An attribute is mapped to a relation by its name. A relation is mapped with
+       :class:`~scim2_django.storage.Many` or :class:`~scim2_django.storage.Link`.
+   * - ``scim2_django.E003``
+     - The relation of a :class:`~scim2_django.storage.Many` or a
+       :class:`~scim2_django.storage.Link` does not fit it. A ``Many`` needs the reverse relation
+       of a foreign key with ``on_delete=CASCADE`` and without null. A ``Link`` holding several
+       entries needs a many-to-many relation. A ``Link`` holding one entry needs a foreign key or
+       a one-to-one field, with ``null=True`` unless the attribute is required.
+   * - ``scim2_django.E004``
+     - The version is not an integer field.
+   * - ``scim2_django.E005``
+     - ``id`` is mapped to a field that is neither the primary key nor unique.
+   * - ``scim2_django.E006``
+     - ``meta.created`` or ``meta.lastModified`` is mapped to a field that is not a
+       :class:`~django.db.models.DateTimeField`.
+   * - ``scim2_django.E007``
+     - The entries of a :class:`~scim2_django.storage.Many` hold a write-only value, or a
+       read-only value next to written ones. Each write replaces the entries, so these values
+       would be lost.
+   * - ``scim2_django.E008``
+     - A string attribute is mapped to a field or an expression that does not hold text.
+   * - ``scim2_django.E009``
+     - The expression of a :class:`~scim2_django.storage.Computed` cannot be computed on the
+       model.
+   * - ``scim2_django.W001``
+     - A readable string attribute is mapped to a text field that converts the values it reads,
+       such as a field decrypting them. Filters and sorts compare the stored values, not the
+       values clients read.
 
 .. _url-names:
 

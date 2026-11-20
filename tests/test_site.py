@@ -23,6 +23,7 @@ from scim2_models import User
 from scim2_server.memory import InMemoryStorage
 from scim2_server.service import ScimService
 
+from examples import scim
 from scim2_django import ScimSite
 
 SCIM_JSON = "application/scim+json"
@@ -34,6 +35,15 @@ BEARER = AuthenticationScheme(
     name="OAuth Bearer Token",
     description="Authentication with an OAuth bearer token",
 )
+
+
+@pytest.fixture(autouse=True)
+def example_storage():
+    """Run each test against an example server with no resource, held in memory."""
+    storage = scim.site.storage
+    scim.site.storage = scim.site.handler.storage = InMemoryStorage()
+    yield
+    scim.site.storage = scim.site.handler.storage = storage
 
 
 def accept_anyone(request):

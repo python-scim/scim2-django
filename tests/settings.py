@@ -6,6 +6,7 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "django.contrib.sessions",
     "scim2_django",
+    "examples",
     "tests",
 ]
 MIDDLEWARE = [
@@ -18,4 +19,5 @@ MIDDLEWARE = [
 ]
 DATABASES = {
     "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
+    "other": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
 }

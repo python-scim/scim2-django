@@ -5,9 +5,7 @@ import pytest
 from django.test import Client
 from django.urls import URLPattern
 from django.urls import URLResolver
-from scim2_server.memory import InMemoryStorage
 
-from examples import scim
 from scim2_django.storage.mapping import _MAPPINGS
 
 
@@ -37,15 +35,6 @@ def serve(settings) -> Callable[..., Client]:
         return create_client()
 
     return serve
-
-
-@pytest.fixture(autouse=True)
-def example_storage() -> Iterator[None]:
-    """Run each test against an example server with no resource."""
-    storage = scim.site.storage
-    scim.site.storage = scim.site.handler.storage = InMemoryStorage()
-    yield
-    scim.site.storage = scim.site.handler.storage = storage
 
 
 @pytest.fixture(autouse=True)

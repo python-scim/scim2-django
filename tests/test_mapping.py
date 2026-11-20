@@ -339,7 +339,7 @@ def test_a_mapping_with_warnings_can_be_used():
     assert mapping.schemas()
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(databases=["default", "other"])
 def test_manage_py_check_reports_the_mappings():
     """The system check reports the mappings that do not fit their fields."""
     mapping = person_mapping(userName="usr_name")
@@ -350,7 +350,7 @@ def test_manage_py_check_reports_the_mappings():
     assert mapping
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(databases=["default", "other"])
 def test_manage_py_check_is_silent_on_valid_mappings():
     """The valid mappings add nothing to the output of manage.py check."""
     mapping = users_mapping()

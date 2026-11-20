@@ -672,9 +672,16 @@ class ResourceMapping:
                 yield collection.type_column
 
     def _unique_columns(self) -> Iterator[_Column]:
-        """Yield the readable columns whose values no two resources share."""
+        """Yield the readable and written columns whose values no two resources share.
+
+        A column never written, such as id, cannot get a value another
+        resource holds.
+        """
         for column in self._columns.values():
-            if column.readable and column.binding.get_annotation(Uniqueness) in (
+            if not (column.readable and column.writable):
+                continue
+
+            if column.binding.get_annotation(Uniqueness) in (
                 Uniqueness.server,
                 Uniqueness.global_,
             ):

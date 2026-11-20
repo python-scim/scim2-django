@@ -228,6 +228,18 @@ def test_a_new_resource_cannot_take_a_value_by_giving_the_identifier_of_its_hold
         )
 
 
+def test_the_identifier_of_another_resource_takes_nothing(server):
+    """The storage never writes id, so a new resource giving the id of another one gets its own."""
+    user = server.create_user("bjensen")
+
+    created = server.storage.create(
+        server.users, server.user_model(id=user.id, user_name="jsmith")
+    )
+
+    assert created.id != user.id
+    assert UserRecord.objects.count() == 2
+
+
 def test_a_resource_type_without_mapping_is_refused():
     """The provider serves groups, which the storage does not map."""
     provider = load_default_provider()

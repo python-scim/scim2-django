@@ -28,6 +28,7 @@ from .comparison import _Comparator
 from .comparison import _comparator
 from .conversion import _as_stored
 from .conversion import _check_storable
+from .conversion import _comparable
 from .conversion import _from_scim
 from .conversion import _link_entries
 from .conversion import _to_scim
@@ -501,15 +502,12 @@ class DjangoStorage(ScimStorage):
 
         for column in mapping._unique_columns():
             value = Path(column.binding.urn).get(resource, strict=False)
-            if value is None:
-                continue
-
             current = (
                 None
                 if stored is None
                 else Path(column.binding.urn).get(stored, strict=False)
             )
-            if value == current:
+            if value is None or _comparable(value) == _comparable(current):
                 continue
 
             condition = _compare(comparator, column, CompareOperator.eq, value)

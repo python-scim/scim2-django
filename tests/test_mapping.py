@@ -290,11 +290,10 @@ def test_the_version_is_a_field_of_the_record():
     assert error_ids(mapping) == ["scim2_django.E001"]
 
 
-def test_the_identifier_is_unique():
-    """Two resources sharing an id could not be told apart."""
-    mapping = ResourceMapping(
-        User, Person, REQUIRED | {"id": "user_name"}, version="version"
-    )
+@pytest.mark.parametrize("field", ["user_name", "serial"], ids=["shared", "nullable"])
+def test_the_identifier_is_unique_and_never_missing(field):
+    """Two resources sharing an id, or a resource without id, could not be told apart."""
+    mapping = ResourceMapping(User, Person, REQUIRED | {"id": field}, version="version")
 
     assert error_ids(mapping) == ["scim2_django.E005"]
 

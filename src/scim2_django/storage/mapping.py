@@ -672,9 +672,16 @@ class ResourceMapping:
                 yield collection.type_column
 
     def _unique_columns(self) -> Iterator[_Column]:
-        """Yield the readable columns whose values no two resources share."""
+        """Yield the readable and written columns whose values no two resources share.
+
+        A column never written, such as id, cannot get a value another
+        resource holds.
+        """
         for column in self._columns.values():
-            if column.readable and column.binding.get_annotation(Uniqueness) in (
+            if not (column.readable and column.writable):
+                continue
+
+            if column.binding.get_annotation(Uniqueness) in (
                 Uniqueness.server,
                 Uniqueness.global_,
             ):
@@ -967,11 +974,13 @@ class ResourceMapping:
                     "scim2_django.E006",
                 )
 
-        if self._id.field is None or not (
-            self._id.field.primary_key or self._id.field.unique
+        field = self._id.field
+        if field is None or not (
+            field.primary_key or (field.unique and not field.null)
         ):
             yield self._error(
-                "'id' must be mapped to the primary key, or to a unique field",
+                "'id' must be mapped to the primary key, or to a unique field "
+                "without null",
                 "scim2_django.E005",
             )
 

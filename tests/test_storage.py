@@ -7,7 +7,6 @@ from django.db.models import F
 from scim2_models import Group
 from scim2_models import InvalidValueException
 from scim2_models import NotFoundException
-from scim2_models import NotImplementedException
 from scim2_models import PreconditionFailedException
 from scim2_models import ResourceType
 from scim2_models import ScimPolicy
@@ -40,7 +39,7 @@ def strict_key(binding, value):
 class Server:
     """A storage of the users and the groups, with its resource types and models."""
 
-    def __init__(self, storage_class=DjangoStorage, policy=None):
+    def __init__(self, storage_class=DjangoStorage, policy=None, mappings=None):
         provider = load_default_provider()
         if policy is not None:
             provider = ScimProvider.from_discovery(
@@ -54,7 +53,9 @@ class Server:
         self.groups = next(rt for rt in provider.resource_types if rt.id == "Group")
         self.user_model = provider.model_for(self.users)
         self.group_model = provider.model_for(self.groups)
-        mappings = {"User": users_mapping(), "Group": groups_mapping()}
+        mappings = {"User": users_mapping(), "Group": groups_mapping()} | (
+            mappings or {}
+        )
         self.storage = storage_class(mappings, provider)
 
     def create_user(self, user_name):
@@ -76,12 +77,6 @@ def test_a_search_on_no_resource_type_finds_nothing(server):
     page = server.storage.search([], SearchRequest())
 
     assert (page.total, page.resources) == (0, [])
-
-
-def test_a_search_at_the_root_is_not_implemented(server):
-    """Searching several resource types at once comes with the cursors."""
-    with pytest.raises(NotImplementedException):
-        server.storage.search([server.users, server.groups], SearchRequest())
 
 
 def test_an_identifier_the_field_cannot_hold_is_not_found(server):
@@ -231,6 +226,18 @@ def test_a_new_resource_cannot_take_a_value_by_giving_the_identifier_of_its_hold
         server.storage.create(
             server.users, server.user_model(id=user.id, user_name="bjensen")
         )
+
+
+def test_the_identifier_of_another_resource_takes_nothing(server):
+    """The storage never writes id, so a new resource giving the id of another one gets its own."""
+    user = server.create_user("bjensen")
+
+    created = server.storage.create(
+        server.users, server.user_model(id=user.id, user_name="jsmith")
+    )
+
+    assert created.id != user.id
+    assert UserRecord.objects.count() == 2
 
 
 def test_a_resource_type_without_mapping_is_refused():

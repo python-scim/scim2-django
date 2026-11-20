@@ -1,3 +1,4 @@
+import dataclasses
 import operator
 from collections.abc import Callable
 from collections.abc import Iterable
@@ -8,9 +9,12 @@ from django.core.exceptions import ValidationError
 from django.db import DEFAULT_DB_ALIAS
 from django.db import models
 from django.db.models import BooleanField
+from django.db.models import ExpressionWrapper
+from django.db.models import IntegerField
 from django.db.models import Q
 from django.db.models import Subquery
 from django.db.models import Value
+from django.db.models.functions import Cast
 from django.db.models.lookups import Exact
 from django.db.models.lookups import GreaterThan
 from django.db.models.lookups import GreaterThanOrEqual
@@ -18,6 +22,7 @@ from django.db.models.lookups import IsNull
 from django.db.models.lookups import LessThan
 from django.db.models.lookups import LessThanOrEqual
 from scim2_models import AttributeBinding
+from scim2_models import InvalidCursorException
 from scim2_models import InvalidFilterException
 from scim2_models import InvalidPathException
 from scim2_models import ScimFilter
@@ -36,6 +41,9 @@ from scim2_models.path import coerce_value
 from .comparison import _SUBSTRINGS
 from .comparison import _Comparator
 from .conversion import _as_stored
+from .keyset import _Anchor
+from .keyset import _beyond
+from .keyset import _keyset_order
 from .mapping import ResourceMapping
 from .mapping import _Collection
 from .mapping import _Column
@@ -400,7 +408,10 @@ def _sort_key(
 
     expression: Any = column.compared
     if column.is_string:
-        expression = comparator.column(column)
+        # The text the database sorts on, without the conversion of a field.
+        expression = ExpressionWrapper(
+            comparator.column(column), output_field=models.TextField()
+        )
 
     if collection is None:
         return expression
@@ -442,29 +453,192 @@ def _search(
     search_request: SearchRequest[Any],
     comparator: _Comparator,
     using: str = DEFAULT_DB_ALIAS,
+    anchor: _Anchor | None = None,
 ) -> tuple["models.QuerySet[Any]", "models.QuerySet[Any]"]:
     """Return the matching records, and the page of them a search asks for.
 
-    The records are ordered by sort value, then by primary key: without the
-    key, records sharing a sort value could change pages from a request to
-    the next. Per RFC 7644 §3.4.2.3, records without a value come last when
-    ascending and first when descending.
+    The records are ordered by sort value, then by identifier: without the
+    identifier, records sharing a sort value could change pages from a
+    request to the next. Per RFC 7644 §3.4.2.3, records without a value come
+    last when ascending and first when descending. Each record of the page
+    holds its sort value under the scim_sort_key attribute, when the search
+    sorts.
+
+    A cursor page is read from the anchor, in the reverse order for a
+    previous page, and holds count + 1 records at most: the last one tells
+    whether a page follows.
     """
     condition = _where(mapping, search_request, comparator)
     matching = mapping.record._default_manager.using(using).filter(condition)
-    key = _sort_key(mapping, search_request, comparator)
-    order: list[Any] = []
-    if key is not None:
-        descending = search_request.sort_order == SearchRequest.SortOrder.descending
-        order.append(
-            key.desc(nulls_first=True) if descending else key.asc(nulls_last=True)
-        )
-
     collections = mapping._returned_collections(search_request)
     page = mapping._queryset(collections, using).filter(condition)
-    page = page.order_by(*order, "pk")
-    start = search_request.start_index_0 or 0
-    if search_request.count is None:
-        return matching, page[start:]
+    key = _sort_key(mapping, search_request, comparator)
+    if key is not None:
+        page = page.annotate(scim_sort_key=key)
+        key = models.F("scim_sort_key")
 
-    return matching, page[start : start + search_request.count]
+    tie = models.F(mapping._id.key)
+    descending = search_request.sort_order == SearchRequest.SortOrder.descending
+    forward = anchor is None or anchor.forward
+    page = page.order_by(*_keyset_order(key, [tie], descending, forward))
+    if search_request.cursor is None:
+        start = search_request.start_index_0 or 0
+        if search_request.count is None:
+            return matching, page[start:]
+
+        return matching, page[start : start + search_request.count]
+
+    if anchor is not None:
+        if key is not None:
+            anchor = _sort_anchor(page, anchor)
+
+        value = _as_key(mapping._id, anchor.ties[0])
+        if value is None:
+            raise InvalidCursorException
+
+        lookup = "gt" if anchor.forward else "lt"
+        tie_after = Q(**{f"{mapping._id.key}__{lookup}": value})
+        page = page.filter(_beyond(key, tie_after, anchor, descending))
+
+    if search_request.count is None:
+        return matching, page
+
+    return matching, page[: search_request.count + 1]
+
+
+def _sort_anchor(page: "models.QuerySet[Any]", anchor: _Anchor) -> _Anchor:
+    """Return an anchor whose sort value has the type of the sort key of a page.
+
+    A sort value the key cannot hold, such as a text on an integer field
+    since the mapping changed, raises InvalidCursorException.
+    """
+    output = page.query.annotations["scim_sort_key"].output_field
+    return _typed_anchor(output, anchor)
+
+
+def _typed_anchor(output: Any, anchor: _Anchor) -> _Anchor:
+    """Return an anchor whose sort value has the type of a field, refusing a value the field cannot hold."""
+    if anchor.key is None:
+        return anchor
+
+    try:
+        key = output.to_python(anchor.key)
+    except (ValidationError, TypeError, ValueError):
+        raise InvalidCursorException from None
+
+    return dataclasses.replace(anchor, key=key)
+
+
+def _root_search(
+    mappings: list[ResourceMapping],
+    search_request: SearchRequest[Any],
+    comparator: _Comparator,
+    using: str = DEFAULT_DB_ALIAS,
+    anchor: _Anchor | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Return the number of matching records of several mappings, and the rows of the page a search asks for.
+
+    Each row holds the position of the mapping as scim_position, the
+    identifier of the record as text as scim_id, so that the identifiers of
+    every model fit in one column, and its sort value as scim_sort_key. A
+    mapping whose model does not declare the sort attribute sorts its records
+    as having no value. The rows are ordered by sort value, then by position
+    and identifier.
+    """
+    conditions = [_where(mapping, search_request, comparator) for mapping in mappings]
+    keys = [_sort_key(mapping, search_request, comparator) for mapping in mappings]
+    outputs = [
+        _output_field(mapping, key)
+        for mapping, key in zip(mappings, keys, strict=True)
+        if key is not None
+    ]
+    if len({output.get_internal_type() for output in outputs}) > 1:
+        raise InvalidPathException(
+            path=str(search_request.sort_by),
+            detail=f"Cannot sort on '{search_request.sort_by}' at the root: "
+            "the resource types store it in fields of different types",
+        )
+
+    output = outputs[0] if outputs else None
+    if anchor is not None:
+        if anchor.ties[0] not in range(len(mappings)):
+            raise InvalidCursorException
+
+        if output is not None:
+            anchor = _typed_anchor(output, anchor)
+
+    matching = []
+    rows = []
+    for position, (mapping, condition, key) in enumerate(
+        zip(mappings, conditions, keys, strict=True)
+    ):
+        records = mapping.record._default_manager.using(using).filter(condition)
+        # A union refuses the default ordering of a model in its branches.
+        records = records.order_by()
+        matching.append(
+            records.annotate(scim_one=Value(1, output_field=IntegerField())).values(
+                "scim_one"
+            )
+        )
+        records = records.annotate(
+            scim_position=Value(position, output_field=IntegerField()),
+            scim_id=ExpressionWrapper(
+                mapping._id.compared, output_field=models.TextField()
+            ),
+        )
+        names = ["scim_position", "scim_id"]
+        if output is not None:
+            records = records.annotate(
+                scim_sort_key=Cast(Value(None), output.clone()) if key is None else key
+            )
+            names.append("scim_sort_key")
+
+        if anchor is not None:
+            records = records.filter(
+                _root_beyond(position, output, anchor, search_request)
+            )
+
+        rows.append(records.values(*names))
+
+    total = matching[0].union(*matching[1:], all=True).count()
+    sort_key = None if output is None else models.F("scim_sort_key")
+    ties = [models.F("scim_position"), models.F("scim_id")]
+    descending = search_request.sort_order == SearchRequest.SortOrder.descending
+    forward = anchor is None or anchor.forward
+    page = rows[0].union(*rows[1:], all=True)
+    page = page.order_by(*_keyset_order(sort_key, ties, descending, forward))
+    if search_request.cursor is None:
+        start = search_request.start_index_0 or 0
+        stop = None if search_request.count is None else start + search_request.count
+        return total, list(page[start:stop])
+
+    stop = None if search_request.count is None else search_request.count + 1
+    return total, list(page[:stop])
+
+
+def _output_field(mapping: ResourceMapping, key: Any) -> Any:
+    """Return the field of the values of a sort key of a mapping."""
+    records = mapping.record._default_manager.annotate(scim_sort_key=key)
+    return records.query.annotations["scim_sort_key"].output_field
+
+
+def _root_beyond(
+    position: int, output: Any, anchor: _Anchor, search_request: SearchRequest[Any]
+) -> Q:
+    """Return the condition keeping the rows of the mapping at a position past the anchor, in the reading direction.
+
+    Rows of an earlier resource type come before the anchor. Rows of a later
+    resource type come after it.
+    """
+    anchor_position, anchor_id = anchor.ties
+    after = position > anchor_position if anchor.forward else position < anchor_position
+    if position != anchor_position:
+        tie_after = _TRUE if after else _FALSE
+    elif anchor.forward:
+        tie_after = Q(GreaterThan(models.F("scim_id"), anchor_id))
+    else:
+        tie_after = Q(LessThan(models.F("scim_id"), anchor_id))
+
+    key = None if output is None else models.F("scim_sort_key")
+    descending = search_request.sort_order == SearchRequest.SortOrder.descending
+    return _beyond(key, tie_after, anchor, descending)

@@ -11,7 +11,6 @@ from django.db import transaction
 from django.db.models import F
 from scim2_models import InvalidValueException
 from scim2_models import NotFoundException
-from scim2_models import NotImplementedException
 from scim2_models import Path
 from scim2_models import PreconditionFailedException
 from scim2_models import Resource
@@ -29,16 +28,82 @@ from .comparison import _Comparator
 from .comparison import _comparator
 from .conversion import _as_stored
 from .conversion import _check_storable
+from .conversion import _comparable
 from .conversion import _from_scim
 from .conversion import _link_entries
 from .conversion import _to_scim
 from .conversion import _version
 from .conversion import _write_collections
+from .keyset import _Anchor
+from .keyset import _anchor
+from .keyset import _position
 from .mapping import ResourceMapping
 from .mapping import _Collection
 from .query import _as_key
 from .query import _compare
+from .query import _root_search
 from .query import _search
+
+
+def _page_rows(
+    rows: list[Any], search_request: SearchRequest[Any], anchor: _Anchor | None
+) -> tuple[list[Any], bool]:
+    """Return the rows of a page in the sort order, and whether more rows follow in the reading direction.
+
+    The rows of a cursor page were read count + 1 at a time, in the reverse
+    order for a previous page.
+    """
+    if search_request.cursor is None:
+        return rows, False
+
+    count = search_request.count
+    more = count is not None and len(rows) > count
+    page = rows if count is None else rows[:count]
+    if anchor is not None and not anchor.forward:
+        page.reverse()
+
+    return page, more
+
+
+_LOADED = 500
+"""The number of records a query loads at most, below the parameter limits of the databases."""
+
+
+def _by_position(rows: list[dict[str, Any]]) -> dict[int, list[str]]:
+    """Group the identifiers of a page at the root by position of their resource type."""
+    ids: dict[int, list[str]] = {}
+    for row in rows:
+        ids.setdefault(row["scim_position"], []).append(row["scim_id"])
+
+    return ids
+
+
+def _cursor_page(
+    total: int,
+    resources: list[Resource[Any]],
+    bounds: list[tuple[Any, tuple[Any, ...]]],
+    more: bool,
+    anchor: _Anchor | None,
+) -> SearchPage:
+    """Return a cursor page with the positions of the pages around it.
+
+    bounds holds the sort value and the ties of the first and the last rows
+    of the page. A page is known to follow in the reading direction only. In
+    the other direction, the page the client comes from is assumed to still
+    exist.
+    """
+    page = SearchPage(total, resources)
+    if not bounds:
+        return page
+
+    forward = anchor is None or anchor.forward
+    if more or not forward:
+        page.next = _position("next", *bounds[-1])
+
+    if anchor is not None and (more or forward):
+        page.previous = _position("previous", *bounds[0])
+
+    return page
 
 
 def _now() -> Any:
@@ -59,7 +124,9 @@ class DjangoStorage(ScimStorage):
     attribute the mapping only reads. A value equal to the stored one is
     accepted, so a resource read and sent back can always be written.
 
-    The storage searches one resource type at a time, and pages by index.
+    The storage searches one resource type, or several at the root of the
+    server as one collection. It pages by index, or with cursors that give
+    stable pages (:rfc:`RFC 9865 <9865>`).
 
     :param mappings: The mapping of each resource type, by resource type name.
     :param provider: The provider of the server. The storage then returns
@@ -69,6 +136,8 @@ class DjangoStorage(ScimStorage):
         :attr:`~scim2_models.ScimPolicy.comparison_key` of its policy.
     :param using: The alias of the database holding the records.
     """
+
+    supports_cursors = True
 
     def __init__(
         self,
@@ -115,28 +184,84 @@ class DjangoStorage(ScimStorage):
         *,
         position: Any = None,
     ) -> SearchPage:
-        """Return a page of the resources of one resource type matching a search.
-
-        :raises ~scim2_models.NotImplementedException: When the search is on
-            several resource types, at the root of the server.
-        """
+        """Return a page of the resources matching a search, on one resource type or at the root."""
         if not resource_types:
             return SearchPage(0, [])
 
         if len(resource_types) > 1:
-            raise NotImplementedException(
-                detail="This server does not search several resource types at once"
-            )
+            return self._root_search(resource_types, search_request, position)
 
         (resource_type,) = resource_types
         mapping = self._mapping(resource_type)
-        matching, page = _search(
-            mapping, search_request, self._comparator(), self.using
+        anchor = _anchor(position, root=False)
+        matching, records = _search(
+            mapping, search_request, self._comparator(), self.using, anchor
         )
+        page, more = _page_rows(list(records), search_request, anchor)
         resources = [
             self._to_scim(resource_type, record, search_request) for record in page
         ]
-        return SearchPage(matching.count(), resources)
+        total = matching.count()
+        if search_request.cursor is None:
+            return SearchPage(total, resources)
+
+        bounds = [
+            (
+                getattr(record, "scim_sort_key", None),
+                (str(getattr(record, mapping._id.key)),),
+            )
+            for record in page[:1] + page[-1:]
+        ]
+        return _cursor_page(total, resources, bounds, more, anchor)
+
+    def _root_search(
+        self,
+        resource_types: list[ResourceType],
+        search_request: SearchRequest[Any],
+        position: Any,
+    ) -> SearchPage:
+        """Return a page of the resources of several resource types, sorted and paged as one collection.
+
+        A record deleted after the page was selected is left out.
+        """
+        mappings = [self._mapping(resource_type) for resource_type in resource_types]
+        anchor = _anchor(position, root=True)
+        total, rows = _root_search(
+            mappings, search_request, self._comparator(), self.using, anchor
+        )
+        rows, more = _page_rows(rows, search_request, anchor)
+        records: dict[tuple[int, str], Any] = {}
+        for type_position, ids in _by_position(rows).items():
+            mapping = mappings[type_position]
+            collections = mapping._returned_collections(search_request)
+            keys = [_as_key(mapping._id, record_id) for record_id in ids]
+            for start in range(0, len(keys), _LOADED):
+                loaded = mapping._queryset(collections, self.using).filter(
+                    **{f"{mapping._id.key}__in": keys[start : start + _LOADED]}
+                )
+                for record in loaded:
+                    record_id = str(getattr(record, mapping._id.key))
+                    records[type_position, record_id] = record
+
+        found = [
+            row for row in rows if (row["scim_position"], row["scim_id"]) in records
+        ]
+        resources = [
+            self._to_scim(
+                resource_types[row["scim_position"]],
+                records[row["scim_position"], row["scim_id"]],
+                search_request,
+            )
+            for row in found
+        ]
+        if search_request.cursor is None:
+            return SearchPage(total, resources)
+
+        bounds = [
+            (row.get("scim_sort_key"), (row["scim_position"], row["scim_id"]))
+            for row in rows[:1] + rows[-1:]
+        ]
+        return _cursor_page(total, resources, bounds, more, anchor)
 
     def create(
         self, resource_type: ResourceType, resource: Resource[Any]
@@ -377,15 +502,12 @@ class DjangoStorage(ScimStorage):
 
         for column in mapping._unique_columns():
             value = Path(column.binding.urn).get(resource, strict=False)
-            if value is None:
-                continue
-
             current = (
                 None
                 if stored is None
                 else Path(column.binding.urn).get(stored, strict=False)
             )
-            if value == current:
+            if value is None or _comparable(value) == _comparable(current):
                 continue
 
             condition = _compare(comparator, column, CompareOperator.eq, value)

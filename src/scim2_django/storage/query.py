@@ -48,6 +48,7 @@ from .keyset import _keyset_order
 from .mapping import ResourceMapping
 from .mapping import _Collection
 from .mapping import _Column
+from .mapping import _Entry
 
 _ORDERINGS: dict[CompareOperator, Callable[[Any, Any], Any]] = {
     CompareOperator.eq: Exact,
@@ -153,7 +154,7 @@ class _FilterTranslator(FilterVisitor[Q]):
     comparison with a missing value holds. Django only ensures it for the
     comparisons of a field, not of an expression.
 
-    scope is the collection that a value selection, such as
+    scope is the collection, or the Entry, that a value selection, such as
     emails[type eq "work"], applies its filter to.
     """
 
@@ -162,7 +163,7 @@ class _FilterTranslator(FilterVisitor[Q]):
         mapping: ResourceMapping,
         scim_filter: ScimFilter[Any],
         comparator: _Comparator,
-        scope: tuple[AttrPath, _Collection] | None = None,
+        scope: tuple[AttrPath, "_Collection | _Entry"] | None = None,
     ) -> None:
         self.mapping = mapping
         self.filter = scim_filter
@@ -205,6 +206,9 @@ class _FilterTranslator(FilterVisitor[Q]):
             return pairs
 
         _, scope = self.scope
+        if isinstance(scope, _Entry):
+            return pairs
+
         return [
             (collection, column) for collection, column in pairs if collection is scope
         ]
@@ -305,11 +309,15 @@ class _FilterTranslator(FilterVisitor[Q]):
         if binding is None:
             return _FALSE
 
-        collections = [
+        collections: list[_Collection | _Entry] = [
             collection
             for collection, _ in self.mapping._lookup(binding)
             if collection is not None
         ]
+        entry = self.mapping._entries.get((binding.model, binding.field_name))
+        if entry is not None:
+            collections = [entry]
+
         if not collections:
             raise _unmapped(binding)
 

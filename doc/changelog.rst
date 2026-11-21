@@ -27,6 +27,8 @@ Added
 - A :class:`~scim2_django.storage.Transformed` field holds an attribute in another form, such as
   an ``id`` made of a prefix and the primary key, or the hash of a password. Filters and sorts
   compare the value clients read, and a search by ``id`` uses the index of the field.
+- An :class:`~scim2_django.storage.Entry` stores a multi-valued attribute holding one entry at
+  most in fields of the resource model, such as the ``emails`` of a user in its ``email`` field.
 - ``meta.created`` and ``meta.lastModified`` are optional in a mapping. Without them, the
   resources have no such date.
 - The version field is optional in a mapping. Without it, ``meta.version`` is a hash of the whole

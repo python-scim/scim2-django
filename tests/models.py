@@ -32,6 +32,7 @@ class UserRecord(models.Model):
     password = models.TextField(null=True)
     employee_number = models.TextField(null=True)
     preferred_language = models.TextField()
+    email = models.EmailField(blank=True)
     badge_number = models.IntegerField(null=True)
     score = models.FloatField(null=True)
     code = CodeField(null=True)

@@ -138,12 +138,23 @@ def _to_scim(
     resource = model()
     special = (mapping._id, mapping._created, mapping._last_modified)
     for column in mapping._columns.values():
-        if column in special:
+        if column in special or column.in_entry:
             continue
 
         value = _read(column, record)
         if value is not None:
             Path[model](column.binding.urn).set(resource, value)  # type: ignore[valid-type]
+
+    for entry in mapping._entries.values():
+        values = {
+            column.binding.urn.rsplit(".", 1)[-1]: _read(column, record)
+            for column in entry.columns.values()
+        }
+        if any(value is not None for value in values.values()):
+            values |= {
+                name: constant for name, (constant, _) in entry.constants.items()
+            }
+            Path[model](entry.binding.urn).set(resource, [values])  # type: ignore[valid-type]
 
     read: dict[str, tuple[bool, list[Any]]] = {}
     for collection in collections:
@@ -199,11 +210,16 @@ def _related(collection: _Collection, record: Any) -> list[Any]:
 
 def _entries(collection: _Collection, resource: Resource[Any]) -> list[Any]:
     """Return the entries a resource holds for a collection, as a list even for a single one."""
-    value = Path(collection.binding.urn).get(resource, strict=False)
     if collection.single:
+        value = Path(collection.binding.urn).get(resource, strict=False)
         return [] if value is None else [value]
 
-    return list(value or [])
+    return _values(collection.binding, resource)
+
+
+def _values(binding: AttributeBinding, resource: Resource[Any]) -> list[Any]:
+    """Return the entries a resource holds for a multi-valued attribute."""
+    return list(Path(binding.urn).get(resource, strict=False) or [])
 
 
 def _read_entry(collection: _Collection, entry: Any, endpoint: str | None) -> Any:
@@ -245,7 +261,7 @@ def _from_scim(
     records each Link of the resource links to.
     """
     for column in mapping._columns.values():
-        if not column.writable or column.relation is not None:
+        if not column.writable or column.relation is not None or column.in_entry:
             continue
 
         value = Path(column.binding.urn).get(resource, strict=False)
@@ -253,6 +269,19 @@ def _from_scim(
             continue
 
         setattr(record, column.field_key, _stored(column, value))
+
+    for entry in mapping._entries.values():
+        entries = _values(entry.binding, resource)
+        if not entry.writable or (creating and not entries):
+            continue
+
+        item = entries[0] if entries else None
+        for column in entry.columns.values():
+            value = getattr(item, column.binding.target_field_name, None)
+            if value is None and _keeps(column, creating):
+                continue
+
+            setattr(record, column.field_key, _stored(column, value))
 
     for collection in _written(mapping):
         if collection.single and not collection.owned:
@@ -445,6 +474,7 @@ def _check_storable(
     derived ones.
     """
     _check_entry_values(mapping, resource)
+    _check_single_entries(mapping, resource)
     model = type(resource)
     for path in Path[model].iter_paths():  # type: ignore[valid-type]
         binding = path.resolve()
@@ -471,7 +501,12 @@ def _check_storable(
             _check_written(mapping, binding, value, current, stored is None)
             continue
 
-        if storage in (_Storage.derived, _Storage.ref, _Storage.link_type) or value in (
+        if storage in (
+            _Storage.derived,
+            _Storage.ref,
+            _Storage.link_type,
+            _Storage.constant,
+        ) or value in (
             None,
             current,
         ):
@@ -526,6 +561,35 @@ def _check_entry_values(mapping: ResourceMapping, resource: Resource[Any]) -> No
                     raise InvalidValueException(
                         detail=f"'{column.binding.urn}' is required on this server"
                     )
+
+
+def _check_single_entries(mapping: ResourceMapping, resource: Resource[Any]) -> None:
+    """Refuse several entries for an Entry, or an entry with another value than one of its constants."""
+    for entry in mapping._entries.values():
+        entries = _values(entry.binding, resource)
+        if len(entries) > 1:
+            raise InvalidValueException(
+                detail=f"'{entry.binding.urn}' holds one entry at most on this server"
+            )
+
+        for item in entries:
+            for constant, column in entry.constants.values():
+                value = _as_stored(
+                    getattr(item, column.binding.target_field_name, None)
+                )
+                if value is not None and not _matches(column, value, constant):
+                    raise InvalidValueException(
+                        detail=f"'{column.binding.urn}' can only be {constant!r} "
+                        "on this server"
+                    )
+
+
+def _matches(column: _Column, value: Any, constant: Any) -> bool:
+    """Tell whether a value is a constant, without their case for a string that is not case exact."""
+    if column.casefolded and isinstance(value, str):
+        return bool(value.casefold() == constant.casefold())
+
+    return bool(value == constant)
 
 
 def _check_enumerated(

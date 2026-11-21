@@ -79,6 +79,11 @@ The checks report the following errors and warnings:
    * - ``scim2_django.E009``
      - The expression of a :class:`~scim2_django.storage.Computed` cannot be computed on the
        model.
+   * - ``scim2_django.E010``
+     - An attribute is mapped to a field of another model, other than through one reverse
+       one-to-one relation of the resource model. Or ``id``, a date or an entry is mapped
+       through a relation. Or the related model has a field without default that the mapping
+       leaves out, so the storage cannot create its records.
    * - ``scim2_django.W001``
      - A readable string attribute is mapped to a text field that converts the values it reads,
        such as a field decrypting them. Filters and sorts compare the stored values, not the

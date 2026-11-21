@@ -69,7 +69,7 @@ def save(mapping, resource, record, links=None, creating=True):
     record.last_modified = NOW
     _from_scim(mapping, resource, record, links, creating=creating)
     record.save()
-    _write_collections(mapping, resource, record, links)
+    _write_collections(mapping, resource, record, links, creating=creating)
     return type(record).objects.get(pk=record.pk)
 
 

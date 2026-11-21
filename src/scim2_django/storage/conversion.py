@@ -8,6 +8,7 @@ from inspect import isclass
 from typing import Any
 
 from django.conf import settings
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
 from django.utils.crypto import salted_hmac
 from pydantic import BaseModel
@@ -22,6 +23,7 @@ from scim2_models import Resource
 from .mapping import ResourceMapping
 from .mapping import _Collection
 from .mapping import _Column
+from .mapping import _needs_value
 from .mapping import _Storage
 
 
@@ -59,12 +61,29 @@ def _as_stored(value: Any) -> Any:
     return value
 
 
+def _get(column: _Column, record: Any) -> Any:
+    """Return the value a record holds for a column, None when the related record holding it does not exist."""
+    if column.relation is None:
+        return getattr(record, column.key)
+
+    related = _related_record(column, record)
+    return None if related is None else getattr(related, column.field.name)  # type: ignore[union-attr]
+
+
+def _related_record(column: _Column, record: Any) -> Any:
+    """Return the related record holding the field of a column, or None when it does not exist."""
+    try:
+        return getattr(record, column.relation.get_accessor_name())
+    except ObjectDoesNotExist:
+        return None
+
+
 def _read(column: _Column, record: Any) -> Any:
     """Return the SCIM value of a column of a record, or None if the column is not read.
 
     An empty string is no value, as Django text fields store it.
     """
-    value = getattr(record, column.key)
+    value = _get(column, record)
     if value is None or not column.readable or (value == "" and column.empty_string):
         return None
 
@@ -84,7 +103,7 @@ def _version(mapping: ResourceMapping, record: Any, resource: Resource[Any]) -> 
         return f'W/"{getattr(record, mapping.version)}"'
 
     hidden = {
-        column.binding.urn: repr(getattr(record, column.key))
+        column.binding.urn: repr(_get(column, record))
         for column in mapping._columns.values()
         if not column.readable
     }
@@ -224,7 +243,7 @@ def _from_scim(
     the resource links to.
     """
     for column in mapping._columns.values():
-        if not column.writable:
+        if not column.writable or column.relation is not None:
             continue
 
         value = Path(column.binding.urn).get(resource, strict=False)
@@ -251,12 +270,14 @@ def _write_collections(
     resource: Resource[Any],
     record: Any,
     links: dict[_Collection, list[Any]],
+    creating: bool,
 ) -> None:
-    """Write the entries and the links of a resource, once its record is saved.
+    """Write the related records, the entries and the links of a resource, once its record is saved.
 
     The entries of a Many replace the former ones, which are deleted. The
     links of a Link holding several entries replace the former links.
     """
+    _write_related(mapping, resource, record, creating)
     for collection in _written(mapping):
         if collection.owned:
             getattr(record, collection.accessor).all().delete()
@@ -267,6 +288,59 @@ def _write_collections(
             )
         elif not collection.single:
             getattr(record, collection.accessor).set(links[collection])
+
+
+def _write_related(
+    mapping: ResourceMapping, resource: Resource[Any], record: Any, creating: bool
+) -> None:
+    """Write the fields of a resource that related records hold, once its record is saved.
+
+    A related record is created at the first value it gets, so that a
+    resource without such values gets no related record. A missing value is
+    not written in a new related record, nor when creating the resource, so
+    that the field keeps its default. A new related record needs a value for
+    each mapped field without default.
+    """
+    values: dict[Any, list[tuple[_Column, Any]]] = {}
+    for column in mapping._columns.values():
+        if not column.writable or column.relation is None:
+            continue
+
+        value = Path(column.binding.urn).get(resource, strict=False)
+        if value is None and (creating or not column.readable):
+            continue
+
+        values.setdefault(column.relation, []).append((column, value))
+
+    for relation, written in values.items():
+        related = _related_record(written[0][0], record)
+        if related is None:
+            written = [
+                (column, value) for column, value in written if value is not None
+            ]
+            if not written:
+                continue
+
+            _check_creatable(mapping, relation, written)
+            related = relation.related_model(**{relation.field.name: record})
+
+        for column, value in written:
+            setattr(related, column.field.name, _stored(column, value))  # type: ignore[union-attr]
+
+        related.save(using=record._state.db)
+
+
+def _check_creatable(
+    mapping: ResourceMapping, relation: Any, written: list[tuple[_Column, Any]]
+) -> None:
+    """Refuse to create a related record without a value for a mapped field that has no default."""
+    given = {column for column, _ in written}
+    for column in mapping._columns.values():
+        if column.relation is relation and column not in given:
+            if not column.nullable and _needs_value(column.field):  # type: ignore[arg-type]
+                raise InvalidValueException(
+                    detail=f"'{column.binding.urn}' is required on this server"
+                )
 
 
 def _written(mapping: ResourceMapping) -> Iterable[_Collection]:

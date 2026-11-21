@@ -426,13 +426,44 @@ class DjangoStorage(ScimStorage):
 
         collections = mapping._returned_collections(parameters)
         records = mapping._queryset(collections, self.using)
-        if locked:
+        relations = mapping._relations()
+        if locked and relations and self._locks_tables():
+            # FOR UPDATE fails on the nullable side of the outer join that
+            # select_related adds, so the related records are locked apart.
+            parents = mapping.record._meta.parents.values()
+            records = records.select_for_update(
+                of=("self", *(link.name for link in parents if link is not None))
+            )
+        elif locked:
             records = records.select_for_update()
 
         try:
-            return records.get(**{mapping._id.key: key})
+            record = records.get(**{mapping._id.key: key})
         except mapping.record.DoesNotExist:
             raise self._not_found(resource_type, resource_id) from None
+
+        if locked:
+            self._lock_related(relations, record)
+
+        return record
+
+    def _locks_tables(self) -> bool:
+        """Tell whether the database locks the rows of chosen tables only."""
+        return bool(connections[self.using].features.has_select_for_update_of)
+
+    def _lock_related(self, relations: list[Any], record: Any) -> None:
+        """Read again, and lock, the related records holding fields of a locked record.
+
+        Another transaction may have written them while this one waited for
+        the lock, or created them.
+        """
+        for relation in relations:
+            related = (
+                relation.related_model._default_manager.using(self.using)
+                .select_for_update()
+                .filter(**{relation.field.name: record})
+            )
+            relation.set_cached_value(record, next(iter(related), None))
 
     @staticmethod
     def _not_found(
@@ -490,7 +521,9 @@ class DjangoStorage(ScimStorage):
         try:
             with transaction.atomic(using=self.using):
                 record.save(using=self.using)
-                _write_collections(mapping, resource, record, links)
+                _write_collections(
+                    mapping, resource, record, links, creating=stored is None
+                )
         except IntegrityError:
             self._check_uniqueness(mapping, resource, stored)
             raise

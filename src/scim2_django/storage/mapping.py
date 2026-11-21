@@ -201,7 +201,9 @@ class _Column:
 
     key is the name of the field, or the alias the expression is annotated
     under. textual tells whether filters compare the field as text, as they do
-    for an integer identifier.
+    for an integer identifier. relation is the reverse one-to-one relation
+    leading to the record holding the field, when the field is not one of the
+    resource record, as in "scim__external_id".
     """
 
     binding: AttributeBinding
@@ -211,6 +213,7 @@ class _Column:
     field: "models.Field[Any, Any] | None" = None
     expression: Any = None
     textual: bool = False
+    relation: Any = None
 
     @property
     def is_string(self) -> bool:
@@ -240,18 +243,13 @@ class _Column:
         """Whether a new record needs a value.
 
         It does when the field can hold no value, and gets none from a default
-        or from Django, as a date with auto_now does.
+        or from Django, as a date with auto_now does. A field of a related
+        record needs none, as the related record may not exist.
         """
-        field = self.field
-        if field is None or self.nullable:
+        if self.field is None or self.nullable or self.relation is not None:
             return False
 
-        return not (
-            field.has_default()
-            or field.has_db_default()
-            or getattr(field, "auto_now", False)
-            or getattr(field, "auto_now_add", False)
-        )
+        return _needs_value(self.field)
 
     @property
     def enumeration(self) -> list[Any] | None:
@@ -389,6 +387,9 @@ class _Collection:
         entries = self.entry_model._default_manager.order_by(*self.order())
         if self.target is not None:
             entries = entries.annotate(**self.target._annotations())
+            related = self.target._related_names()
+            if related:
+                entries = entries.select_related(*related)
 
         return Prefetch(self.accessor, queryset=entries)
 
@@ -422,7 +423,11 @@ class ResourceMapping:
     :param record: The Django model of the records.
     :param attributes: The attributes, by SCIM path. A value is the name of a
         field, an :class:`Attribute`, a :class:`Computed`, a :class:`Many`, a
-        :class:`Link`, or a list of :class:`Link`. ``id`` is required.
+        :class:`Link`, or a list of :class:`Link`. A field of a model related
+        by a reverse one-to-one relation, such as a table beside the users,
+        is mapped with a path such as ``"scim__external_id"``. The storage
+        creates the related record at the first value it writes there.
+        ``id`` is required.
         ``meta.created`` and ``meta.lastModified`` are filled by the storage:
         without them, the resources have no such date.
     :param version: The name of an integer field counting the writes of each
@@ -729,6 +734,10 @@ class ResourceMapping:
     ) -> "models.QuerySet[Any]":
         """Return the records of a database with their computed attributes, and the given collections loaded along."""
         records = self.record._default_manager.using(using)
+        related = self._related_names()
+        if related:
+            records = records.select_related(*related)
+
         return records.annotate(**self._annotations()).prefetch_related(
             *(collection.prefetch() for collection in collections)
         )
@@ -784,6 +793,7 @@ class ResourceMapping:
                     column.field,
                     column.expression,
                     column.textual,
+                    column.relation,
                 )
 
     def _target(
@@ -975,6 +985,7 @@ class ResourceMapping:
                     self._columns[(*key, binding.sub_field_name)] = column
 
         yield from self._check_version()
+        yield from self._check_related()
         if not self._is_resolved():
             return
 
@@ -1076,7 +1087,15 @@ class ResourceMapping:
             return column
 
         attribute = value if isinstance(value, Attribute) else Attribute(value)
-        field = yield from self._field(model, attribute.field, path)
+        relation, name = None, attribute.field
+        if "__" in attribute.field:
+            relation = yield from self._relation(model, path, binding, attribute.field)
+            if relation is None:
+                return None
+
+            model, name = relation.related_model, attribute.field.partition("__")[2]
+
+        field = yield from self._field(model, name, path)
         if field is None:
             return None
 
@@ -1090,10 +1109,11 @@ class ResourceMapping:
 
         column = _Column(
             binding,
-            field.name,
+            attribute.field,
             attribute.readable and readable,
             attribute.writable and writable and not field.generated,
             field,
+            relation=relation,
         )
         if not column.is_string or _key(binding) == _key(self._resolve("id")):
             return column
@@ -1112,6 +1132,72 @@ class ResourceMapping:
             )
 
         return column
+
+    def _relation(
+        self, model: type[models.Model], path: str, binding: AttributeBinding, name: str
+    ) -> Generator[checks.CheckMessage, None, Any]:
+        """Return the reverse one-to-one relation a field name leads through, yielding an error for any other path.
+
+        Only a field of the resource record leads through a relation, and only
+        an attribute the storage does not fill itself.
+        """
+        relation_name, _, field_name = name.partition("__")
+        fields = {_key(self._resolve(path)) for path in self._FIELDS}
+        relation = None
+        if model is self.record and _key(binding) not in fields:
+            relation = yield from self._field(model, relation_name, path)
+            if relation is None:
+                return None
+
+        if (
+            not isinstance(relation, ForeignObjectRel)
+            or not relation.one_to_one
+            or "__" in field_name
+        ):
+            yield self._error(
+                f"{path!r} is mapped to {name!r}: a field of another model is "
+                "reached through one reverse one-to-one relation of the resource "
+                "model, for an attribute the storage does not fill itself",
+                "scim2_django.E010",
+            )
+            return None
+
+        return relation
+
+    def _check_related(self) -> Iterator[checks.CheckMessage]:
+        """Refuse a related model that the storage cannot create from the mapped fields only."""
+        mapped: dict[Any, set[str]] = {}
+        for column in self._columns.values():
+            if column.relation is not None:
+                mapped.setdefault(column.relation, set()).add(column.field.name)  # type: ignore[union-attr]
+
+        for relation, names in mapped.items():
+            for field in relation.related_model._meta.concrete_fields:
+                if field is relation.field or field.name in names:
+                    continue
+
+                # Django gives an empty string to a text field without value.
+                if _needs_value(field) and not field.empty_strings_allowed:
+                    yield self._error(
+                        f"{relation.get_accessor_name()!r} leads to "
+                        f"{relation.related_model._meta.label} records, whose "
+                        f"field {field.name!r} needs a value: map it, or give it "
+                        "a default",
+                        "scim2_django.E010",
+                    )
+
+    def _relations(self) -> list[Any]:
+        """Return the relations leading to the records holding mapped fields, by name."""
+        relations = {
+            column.relation.name: column.relation
+            for column in self._columns.values()
+            if column.relation is not None
+        }
+        return [relations[name] for name in sorted(relations)]
+
+    def _related_names(self) -> list[str]:
+        """Return the names select_related takes for the relations leading to the records holding mapped fields."""
+        return [relation.name for relation in self._relations()]
 
     def _not_text(self, path: str, holder: str) -> checks.Error:
         """Return the error of a string attribute held by something else than text."""
@@ -1280,6 +1366,19 @@ def _required(binding: AttributeBinding) -> bool:
     return Required.true in (
         binding.model.get_field_annotation(binding.field_name, Required),
         binding.get_annotation(Required),
+    )
+
+
+def _needs_value(field: "models.Field[Any, Any]") -> bool:
+    """Tell whether a new record needs a value for a field: Django fills it neither from a default nor by itself."""
+    return not (
+        field.null
+        or field.has_default()
+        or field.has_db_default()
+        or field.generated
+        or getattr(field, "db_returning", False)
+        or getattr(field, "auto_now", False)
+        or getattr(field, "auto_now_add", False)
     )
 
 

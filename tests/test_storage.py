@@ -273,3 +273,16 @@ def test_the_storage_reads_and_writes_the_database_it_is_given(server):
     assert not UserRecord.objects.exists()
     page = storage.search([server.users], SearchRequest(filter="emails pr"))
     assert [found.id for found in page.resources] == [user.id]
+
+
+@pytest.mark.parametrize("text", ["0{id}", "+{id}", " {id}"])
+def test_a_resource_is_found_by_the_exact_text_of_its_identifier(server, text):
+    """The text "01" is not the identifier "1", whose field reads it as 1, as filters have it."""
+    group = server.create_group([])
+    value = text.format(id=group.id)
+
+    with pytest.raises(NotFoundException):
+        server.storage.get(server.groups, value)
+
+    with pytest.raises(InvalidValueException):
+        server.create_group([{"value": value, "type": "Group"}])

@@ -1,3 +1,7 @@
+from django.db.models import TextField
+from django.db.models import Value
+from django.db.models.functions import Cast
+from django.db.models.functions import Concat
 from scim2_models import EnterpriseUser
 from scim2_models import Group
 from scim2_models import User
@@ -6,11 +10,32 @@ from scim2_django.storage import Attribute
 from scim2_django.storage import Link
 from scim2_django.storage import Many
 from scim2_django.storage import ResourceMapping
+from scim2_django.storage import Transformed
 
 from .models import GroupRecord
 from .models import UserRecord
 
 ENTERPRISE = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
+
+
+def prefixed(prefix, field="id"):
+    """Return the mapping of an identifier made of a prefix and the value of a field."""
+
+    def to_field(value):
+        if not value.startswith(prefix):
+            raise ValueError(value)
+
+        return value.removeprefix(prefix)
+
+    expression = Concat(
+        Value(prefix), Cast(field, TextField()), output_field=TextField()
+    )
+    return Transformed(field, expression=expression, to_field=to_field)
+
+
+def hashed(value):
+    """Return a password as a fake hash, which tells no value apart from no password."""
+    return "!" if value is None else f"hash:{value}"
 
 
 def users_mapping(changes=None, version="version"):

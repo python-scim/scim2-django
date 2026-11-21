@@ -18,6 +18,7 @@ from django.db.models.functions import Cast
 from django.db.models.lookups import Exact
 from django.db.models.lookups import GreaterThan
 from django.db.models.lookups import GreaterThanOrEqual
+from django.db.models.lookups import In
 from django.db.models.lookups import IsNull
 from django.db.models.lookups import LessThan
 from django.db.models.lookups import LessThanOrEqual
@@ -85,10 +86,16 @@ _FALSE = Q(Value(False, output_field=BooleanField()))
 
 
 def _as_key(column: _Column, value: Any) -> Any:
-    """Return an identifier in the type of its field, or None when the field cannot hold it."""
+    """Return an identifier in the type of its field, or None when the field cannot hold it.
+
+    A transformed identifier is converted by to_field first.
+    """
     try:
+        if column.to_field is not None:
+            value = column.to_field(value)
+
         return column.field.to_python(value)  # type: ignore[union-attr]
-    except ValidationError:
+    except (TypeError, ValueError, ValidationError):
         return None
 
 
@@ -96,13 +103,33 @@ def _exact_key(column: _Column, value: str) -> Any:
     """Return an identifier in the type of its field, or None when the field holds no such identifier.
 
     The field holds it only when it gives back the same text, so "01" does not
-    find the identifier 1.
+    find the identifier 1. The expression of a transformed identifier tells
+    it in the database instead.
     """
     key = _as_key(column, value)
-    if key is None or str(key) != value:
-        return None
+    if column.transformed or key is None or str(key) == value:
+        return key
 
-    return key
+    return None
+
+
+def _with_ids(column: _Column, values: Iterable[str | None]) -> Q:
+    """Return the condition keeping the records whose identifier is one of values.
+
+    The field is compared, so that the database uses its index. An identifier
+    is found by its exact text only: "01" does not find the identifier "1".
+    The expression of a transformed identifier is compared too, so that
+    "u012" does not find the identifier "u12".
+    """
+    texts = [value for value in values if value is not None]
+    keys = [
+        key for key in (_exact_key(column, text) for text in texts) if key is not None
+    ]
+    condition = Q(**{f"{column.field_key}__in": keys})
+    if column.transformed:
+        condition &= Q(In(column.compared, texts))
+
+    return condition
 
 
 def _unmapped(binding: AttributeBinding) -> InvalidFilterException:
@@ -337,7 +364,7 @@ def _compare(
 
         return _FALSE
 
-    if column.textual and op in (CompareOperator.eq, CompareOperator.ne):
+    if column.keyed and op in (CompareOperator.eq, CompareOperator.ne):
         return _compare_key(column, op, value)
 
     if not column.is_string:
@@ -376,11 +403,15 @@ def _compare_key(column: _Column, op: CompareOperator, value: str) -> Q:
     if key is None:
         return _TRUE if op == CompareOperator.ne else _FALSE
 
-    field = models.F(column.key)
-    if op == CompareOperator.ne:
-        return _is_null(field) | ~_lookup(column, "exact", key)
+    field = models.F(column.field_key)
+    condition = Q(**{f"{column.field_key}__exact": key})
+    if column.transformed:
+        condition &= Q(Exact(column.compared, value))
 
-    return _is_not_null(field) & _lookup(column, "exact", key)
+    if op == CompareOperator.ne:
+        return _is_null(field) | ~condition
+
+    return _is_not_null(field) & condition
 
 
 def _lookup(column: _Column, name: str, value: Any) -> Q:
@@ -492,7 +523,7 @@ def _search(
         page = page.annotate(scim_sort_key=key)
         key = models.F("scim_sort_key")
 
-    tie = models.F(mapping._id.key)
+    tie = models.F(mapping._id.field_key)
     descending = search_request.sort_order == SearchRequest.SortOrder.descending
     forward = anchor is None or anchor.forward
     page = page.order_by(*_keyset_order(key, [tie], descending, forward))
@@ -512,7 +543,7 @@ def _search(
             raise InvalidCursorException
 
         lookup = "gt" if anchor.forward else "lt"
-        tie_after = Q(**{f"{mapping._id.key}__{lookup}": value})
+        tie_after = Q(**{f"{mapping._id.field_key}__{lookup}": value})
         page = page.filter(_beyond(key, tie_after, anchor, descending))
 
     if search_request.count is None:

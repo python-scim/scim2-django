@@ -2,9 +2,12 @@ import pytest
 from scim2_server.testing import ScimStorageContract
 
 from scim2_django.storage import DjangoStorage
+from scim2_django.storage import Transformed
 
 from .mappings import ENTERPRISE
 from .mappings import groups_mapping
+from .mappings import hashed
+from .mappings import prefixed
 from .mappings import users_mapping
 
 pytestmark = pytest.mark.django_db
@@ -56,4 +59,20 @@ class TestDjangoStorageWithRelatedFields(ScimStorageContract):
             f"{ENTERPRISE}:division": "scim__division",
         }
         mappings = {"User": users_mapping(beside), "Group": groups_mapping()}
+        return DjangoStorage(mappings, provider)
+
+
+class TestDjangoStorageWithTransformedFields(ScimStorageContract):
+    """Identifiers made of a prefix and the primary key, and hashed passwords."""
+
+    @pytest.fixture
+    def storage(self, provider):
+        users = {
+            "id": prefixed("u"),
+            "password": Transformed("password", to_field=hashed),
+        }
+        mappings = {
+            "User": users_mapping(users),
+            "Group": groups_mapping({"id": prefixed("g")}),
+        }
         return DjangoStorage(mappings, provider)

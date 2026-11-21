@@ -1,10 +1,12 @@
 import weakref
+from collections.abc import Callable
 from collections.abc import Generator
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from dataclasses import replace
 from enum import Enum
 from inspect import isclass
 from typing import Any
@@ -130,6 +132,47 @@ class Computed:
         self.expression = expression
 
 
+class Transformed:
+    """A field holding a SCIM attribute in another form, such as an identifier with a prefix, or the hash of a password.
+
+    The storage reads the value clients read through ``expression``, so that
+    filters and sorts compare it in the database. It writes the value clients
+    send through ``to_field``. The two must agree: ``to_field`` gives back the
+    field value ``expression`` was computed from.
+
+    An attribute without ``expression`` is write-only, such as a password. An
+    attribute without ``to_field`` is read-only. ``id`` needs both: the
+    storage finds a resource by its ``id`` through ``to_field``, so that the
+    database uses the index of the field.
+
+    :param field: The name of the field holding the value.
+    :param expression: The :doc:`query expression <django:ref/models/expressions>`
+        computing the value clients read from the field, such as
+        ``Concat(Value("u"), Cast("id", TextField()), output_field=TextField())``.
+    :param to_field: The function converting a value clients send into the
+        value of the field, such as
+        :func:`~django.contrib.auth.hashers.make_password`. It gets None for
+        no value, and when a resource is created without value. A
+        :exc:`ValueError`, a :exc:`TypeError` or a
+        :exc:`~django.core.exceptions.ValidationError` it raises refuses the
+        value, and so does None for a field without null.
+    """
+
+    def __init__(
+        self,
+        field: str,
+        *,
+        expression: Any = None,
+        to_field: Callable[[Any], Any] | None = None,
+    ) -> None:
+        if expression is None and to_field is None:
+            raise ValueError(f"Transformed({field!r}) needs expression or to_field")
+
+        self.field = field
+        self.expression = expression
+        self.to_field = to_field
+
+
 class Many:
     """The entries of a multi-valued attribute, stored in the records of another model.
 
@@ -201,9 +244,14 @@ class _Column:
 
     key is the name of the field, or the alias the expression is annotated
     under. textual tells whether filters compare the field as text, as they do
-    for an integer identifier. relation is the reverse one-to-one relation
-    leading to the record holding the field, when the field is not one of the
-    resource record, as in "scim__external_id".
+    for an integer identifier. keyed tells whether filters find an
+    identifier by the value of its field, so that the database uses its
+    index. relation is the reverse one-to-one relation leading to the record
+    holding the field, when the field is not one of the resource record, as in
+    "scim__external_id".
+
+    A transformed field is read through its expression, under key, and
+    written through to_field, under field_key.
     """
 
     binding: AttributeBinding
@@ -214,6 +262,19 @@ class _Column:
     expression: Any = None
     textual: bool = False
     relation: Any = None
+    to_field: Callable[[Any], Any] | None = None
+    path: str | None = None
+    keyed: bool = False
+
+    @property
+    def field_key(self) -> str:
+        """The name of the field in lookups, which differs from key for a transformed field."""
+        return self.path or self.key
+
+    @property
+    def transformed(self) -> bool:
+        """Whether the field holds the values in another form than clients read and send."""
+        return self.path is not None
 
     @property
     def is_string(self) -> bool:
@@ -229,14 +290,29 @@ class _Column:
     def empty_string(self) -> bool:
         """Whether the field holds an empty string for no value.
 
-        Django text fields without null do so.
+        Django text fields without null do so. A transformed field holds what
+        to_field gives for no value.
         """
-        return self.is_string and self.field is not None and not self.field.null
+        return (
+            self.is_string
+            and self.field is not None
+            and not self.field.null
+            and not self.transformed
+        )
 
     @property
     def nullable(self) -> bool:
-        """Whether the field can hold no value. An expression is taken as nullable."""
-        return self.field is None or bool(self.field.null) or self.empty_string
+        """Whether the field can hold no value.
+
+        An expression is taken as nullable, and so is a transformed field,
+        which holds what to_field gives for no value.
+        """
+        return (
+            self.field is None
+            or self.transformed
+            or bool(self.field.null)
+            or self.empty_string
+        )
 
     @property
     def required(self) -> bool:
@@ -253,8 +329,11 @@ class _Column:
 
     @property
     def enumeration(self) -> list[Any] | None:
-        """The values a field with choices stores, or None for a field without choices."""
-        if self.field is None or not self.field.choices:
+        """The values a field with choices stores, or None for a field without choices.
+
+        A transformed field stores other values than clients send.
+        """
+        if self.field is None or self.transformed or not self.field.choices:
             return None
 
         return [value for value, _ in self.field.flatchoices]
@@ -422,12 +501,13 @@ class ResourceMapping:
         ``User[EnterpriseUser]``.
     :param record: The Django model of the records.
     :param attributes: The attributes, by SCIM path. A value is the name of a
-        field, an :class:`Attribute`, a :class:`Computed`, a :class:`Many`, a
-        :class:`Link`, or a list of :class:`Link`. A field of a model related
+        field, an :class:`Attribute`, a :class:`Computed`, a
+        :class:`Transformed`, a :class:`Many`, a :class:`Link`, or a list of
+        :class:`Link`. A field of a model related
         by a reverse one-to-one relation, such as a table beside the users,
         is mapped with a path such as ``"scim__external_id"``. The storage
         creates the related record at the first value it writes there.
-        ``id`` is required.
+        ``id`` is required, and maps to a field or a :class:`Transformed`.
         ``meta.created`` and ``meta.lastModified`` are filled by the storage:
         without them, the resources have no such date.
     :param version: The name of an integer field counting the writes of each
@@ -785,15 +865,8 @@ class ResourceMapping:
                 if binding is None or column is None:
                     continue
 
-                collection.columns[binding.sub_field_name] = _Column(
-                    binding,
-                    column.key,
-                    column.readable,
-                    False,
-                    column.field,
-                    column.expression,
-                    column.textual,
-                    column.relation,
+                collection.columns[binding.sub_field_name] = replace(
+                    column, binding=binding, writable=False
                 )
 
     def _target(
@@ -885,6 +958,18 @@ class ResourceMapping:
 
         self._check_value(path, binding)
         self._check_field_value(path, value)
+        if _key(binding) == _key(self._resolve("id")) and isinstance(
+            value, Transformed
+        ):
+            if value.expression is None or value.to_field is None:
+                raise ValueError(
+                    f"{path!r} is mapped to a Transformed, which needs an "
+                    "expression and to_field"
+                )
+
+            self._declared[path] = (binding, value)
+            return
+
         fields = {_key(self._resolve(path)) for path in self._FIELDS}
         if _key(binding) in fields and not isinstance(value, str):
             raise ValueError(f"{path!r} must be mapped to the name of a field")
@@ -926,20 +1011,20 @@ class ResourceMapping:
 
     def _check_entry_value(self, path: str, value: Any) -> None:
         """Refuse a value of an entry that is not the name of a field, or an Attribute."""
-        if isinstance(value, Computed):
+        if isinstance(value, Computed | Transformed):
             raise ValueError(
                 f"{path!r} is held by the entries of another model, "
-                "which cannot be computed"
+                "which cannot be computed nor transformed"
             )
 
         self._check_field_value(path, value)
 
     def _check_field_value(self, path: str, value: Any) -> None:
-        """Refuse a value that is not the name of a field, an Attribute, or a Computed."""
-        if not isinstance(value, str | Attribute | Computed):
+        """Refuse a value that is not the name of a field, an Attribute, a Computed, or a Transformed."""
+        if not isinstance(value, str | Attribute | Computed | Transformed):
             raise ValueError(
                 f"{path!r} must be mapped to the name of a field, an Attribute, "
-                "or a Computed"
+                "a Computed, or a Transformed"
             )
 
     def _check_value(self, path: str, binding: AttributeBinding) -> None:
@@ -990,7 +1075,10 @@ class ResourceMapping:
             return
 
         self._id = self._column("id")
-        self._id.textual = not isinstance(self._id.field, _TEXT_FIELDS)
+        self._id.textual = not (
+            self._id.transformed or isinstance(self._id.field, _TEXT_FIELDS)
+        )
+        self._id.keyed = self._id.textual or self._id.transformed
         self._created = self._columns.get(_key(self._resolve("meta.created")))
         self._last_modified = self._columns.get(
             _key(self._resolve("meta.lastModified"))
@@ -1074,47 +1162,38 @@ class ResourceMapping:
         readable = Mutability.write_only not in mutabilities
         writable = Mutability.read_only not in mutabilities
         if isinstance(value, Computed):
-            alias = "scim_" + binding.urn.replace(":", "_").replace(".", "_")
+            alias = _alias(binding)
             output = yield from self._output_field(path, alias, value.expression)
             if output is None:
                 return None
 
-            column = _Column(binding, alias, True, False, expression=value.expression)
-            if column.is_string and not _holds_text(output):
+            computed = _Column(binding, alias, True, False, expression=value.expression)
+            if computed.is_string and not _holds_text(output):
                 yield self._not_text(path, "its expression")
                 return None
 
-            return column
+            return computed
+
+        if isinstance(value, Transformed):
+            return (
+                yield from self._transformed(
+                    model, path, binding, value, readable, writable
+                )
+            )
 
         attribute = value if isinstance(value, Attribute) else Attribute(value)
-        relation, name = None, attribute.field
-        if "__" in attribute.field:
-            relation = yield from self._relation(model, path, binding, attribute.field)
-            if relation is None:
-                return None
-
-            model, name = relation.related_model, attribute.field.partition("__")[2]
-
-        field = yield from self._field(model, name, path)
-        if field is None:
-            return None
-
-        if field.is_relation or not field.concrete:
-            yield self._error(
-                f"{path!r} is mapped to {attribute.field!r}, which is a relation: "
-                "map it with Many or Link",
-                "scim2_django.E002",
-            )
-            return None
-
-        column = _Column(
+        column = yield from self._field_column(
+            model,
+            path,
             binding,
             attribute.field,
             attribute.readable and readable,
-            attribute.writable and writable and not field.generated,
-            field,
-            relation=relation,
+            attribute.writable and writable,
         )
+        if column is None:
+            return None
+
+        field: Any = column.field
         if not column.is_string or _key(binding) == _key(self._resolve("id")):
             return column
 
@@ -1131,6 +1210,86 @@ class ResourceMapping:
                 id="scim2_django.W001",
             )
 
+        return column
+
+    def _field_column(
+        self,
+        model: type[models.Model],
+        path: str,
+        binding: AttributeBinding,
+        name: str,
+        readable: bool,
+        writable: bool,
+    ) -> Generator[checks.CheckMessage, None, _Column | None]:
+        """Build the column of a field, of the record or of a record related by a reverse one-to-one relation.
+
+        A generated field is never written.
+        """
+        relation, field_name = None, name
+        if "__" in name:
+            relation = yield from self._relation(model, path, binding, name)
+            if relation is None:
+                return None
+
+            model, field_name = relation.related_model, name.partition("__")[2]
+
+        field = yield from self._field(model, field_name, path)
+        if field is None:
+            return None
+
+        if field.is_relation or not field.concrete:
+            yield self._error(
+                f"{path!r} is mapped to {name!r}, which is a relation: "
+                "map it with Many or Link",
+                "scim2_django.E002",
+            )
+            return None
+
+        return _Column(
+            binding,
+            name,
+            readable,
+            writable and not field.generated,
+            field,
+            relation=relation,
+        )
+
+    def _transformed(
+        self,
+        model: type[models.Model],
+        path: str,
+        binding: AttributeBinding,
+        transformed: Transformed,
+        readable: bool,
+        writable: bool,
+    ) -> Generator[checks.CheckMessage, None, _Column | None]:
+        """Build the column of a transformed field, read through its expression and written through to_field."""
+        column = yield from self._field_column(
+            model,
+            path,
+            binding,
+            transformed.field,
+            readable and transformed.expression is not None,
+            writable and transformed.to_field is not None,
+        )
+        if column is None:
+            return None
+
+        column.path = transformed.field
+        column.to_field = transformed.to_field
+        if not column.readable:
+            return column
+
+        alias = _alias(binding)
+        output = yield from self._output_field(path, alias, transformed.expression)
+        if output is None:
+            return None
+
+        if column.is_string and not _holds_text(output):
+            yield self._not_text(path, "its expression")
+            return None
+
+        column.key, column.expression = alias, transformed.expression
         return column
 
     def _relation(
@@ -1349,6 +1508,11 @@ class ResourceMapping:
             collections.append(collection)
 
         return collections
+
+
+def _alias(binding: AttributeBinding) -> str:
+    """Return the alias records hold the value of an expression under."""
+    return "scim_" + binding.urn.replace(":", "_").replace(".", "_")
 
 
 def _key(binding: AttributeBinding) -> tuple[Any, ...]:

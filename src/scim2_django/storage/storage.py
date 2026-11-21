@@ -38,10 +38,11 @@ from .keyset import _anchor
 from .keyset import _position
 from .mapping import ResourceMapping
 from .mapping import _Collection
-from .query import _as_key
 from .query import _compare
+from .query import _exact_key
 from .query import _root_search
 from .query import _search
+from .query import _with_ids
 
 
 def _page_rows(
@@ -237,10 +238,9 @@ class DjangoStorage(ScimStorage):
         for type_position, ids in _by_position(rows).items():
             mapping = mappings[type_position]
             collections = mapping._returned_collections(search_request)
-            keys = [_as_key(mapping._id, record_id) for record_id in ids]
-            for start in range(0, len(keys), _LOADED):
+            for start in range(0, len(ids), _LOADED):
                 loaded = mapping._queryset(collections, self.using).filter(
-                    **{f"{mapping._id.key}__in": keys[start : start + _LOADED]}
+                    _with_ids(mapping._id, ids[start : start + _LOADED])
                 )
                 for record in loaded:
                     record_id = str(getattr(record, mapping._id.key))
@@ -284,7 +284,8 @@ class DjangoStorage(ScimStorage):
             _from_scim(mapping, resource, record, links, creating=True)
             self._save(mapping, resource, record, links, None)
 
-        return self.get(resource_type, str(getattr(record, mapping._id.key)))
+        records = mapping._queryset(mapping._returned_collections(), self.using)
+        return self._to_scim(resource_type, records.get(pk=record.pk))
 
     def update(
         self,
@@ -420,16 +421,13 @@ class DjangoStorage(ScimStorage):
         A locked record stays locked until the end of the transaction.
         """
         mapping = self._mapping(resource_type)
-        key = _as_key(mapping._id, resource_id)
-        if key is None:
-            raise self._not_found(resource_type, resource_id)
-
         collections = mapping._returned_collections(parameters)
         records = mapping._queryset(collections, self.using)
         relations = mapping._relations()
-        if locked and relations and self._locks_tables():
-            # FOR UPDATE fails on the nullable side of the outer join that
-            # select_related adds, so the related records are locked apart.
+        if locked and self._locks_tables():
+            # FOR UPDATE fails on the nullable side of an outer join, which
+            # select_related and the expressions reading related records add,
+            # so the related records are locked apart.
             parents = mapping.record._meta.parents.values()
             records = records.select_for_update(
                 of=("self", *(link.name for link in parents if link is not None))
@@ -438,12 +436,13 @@ class DjangoStorage(ScimStorage):
             records = records.select_for_update()
 
         try:
-            record = records.get(**{mapping._id.key: key})
+            record = records.get(_with_ids(mapping._id, [resource_id]))
         except mapping.record.DoesNotExist:
             raise self._not_found(resource_type, resource_id) from None
 
         if locked:
             self._lock_related(relations, record)
+            self._read_expressions(mapping, record)
 
         return record
 
@@ -464,6 +463,25 @@ class DjangoStorage(ScimStorage):
                 .filter(**{relation.field.name: record})
             )
             relation.set_cached_value(record, next(iter(related), None))
+
+    def _read_expressions(self, mapping: ResourceMapping, record: Any) -> None:
+        """Compute again the expressions of a locked record.
+
+        They may read related records, which another transaction may have
+        written while this one waited for the lock.
+        """
+        annotations = mapping._annotations()
+        if not annotations:
+            return
+
+        values = (
+            mapping.record._default_manager.using(self.using)
+            .filter(pk=record.pk)
+            .values(**annotations)
+            .get()
+        )
+        for alias, value in values.items():
+            setattr(record, alias, value)
 
     @staticmethod
     def _not_found(
@@ -544,9 +562,7 @@ class DjangoStorage(ScimStorage):
         comparator = self._comparator()
         others = mapping.record._default_manager.using(self.using)
         if stored is not None:
-            others = others.exclude(
-                **{mapping._id.key: _as_key(mapping._id, stored.id)}
-            )
+            others = others.exclude(_with_ids(mapping._id, [stored.id]))
 
         for column in mapping._unique_columns():
             value = Path(column.binding.urn).get(resource, strict=False)
@@ -585,9 +601,13 @@ class DjangoStorage(ScimStorage):
         """Return the records of a Link holding one of the identifiers."""
         target = collection.target
         assert target is not None
-        keys = [key for key in (_as_key(target._id, i) for i in ids) if key is not None]
-        records = target.record._default_manager.using(self.using)
-        return list(records.filter(**{f"{target._id.key}__in": keys}))
+        records = target.record._default_manager.using(self.using).filter(
+            _with_ids(target._id, ids)
+        )
+        if target._id.transformed:
+            records = records.annotate(**{target._id.key: target._id.expression})
+
+        return list(records)
 
     def _assign_links(
         self, found: list[tuple[_Collection, list[Any]]], entries: list[Any]
@@ -647,6 +667,13 @@ class DjangoStorage(ScimStorage):
 
 
 def _holds_id(collection: _Collection, record: Any, value: str) -> bool:
-    """Tell whether a record a Link links to has an identifier."""
+    """Tell whether a record a Link links to has an identifier.
+
+    A record holds the expression of a transformed identifier, which gives
+    the identifier clients read.
+    """
     target_id = collection.target._id  # type: ignore[union-attr]
-    return bool(getattr(record, target_id.key) == _as_key(target_id, value))
+    if target_id.transformed:
+        return bool(getattr(record, target_id.key) == value)
+
+    return bool(getattr(record, target_id.key) == _exact_key(target_id, value))

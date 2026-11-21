@@ -31,6 +31,8 @@ and Django models.
 
 .. autoclass:: scim2_django.storage.Computed
 
+.. autoclass:: scim2_django.storage.Transformed
+
 .. autoclass:: scim2_django.storage.Many
 
 .. autoclass:: scim2_django.storage.Link
@@ -77,8 +79,8 @@ The checks report the following errors and warnings:
    * - ``scim2_django.E008``
      - A string attribute is mapped to a field or an expression that does not hold text.
    * - ``scim2_django.E009``
-     - The expression of a :class:`~scim2_django.storage.Computed` cannot be computed on the
-       model.
+     - The expression of a :class:`~scim2_django.storage.Computed` or a
+       :class:`~scim2_django.storage.Transformed` cannot be computed on the model.
    * - ``scim2_django.E010``
      - An attribute is mapped to a field of another model, other than through one reverse
        one-to-one relation of the resource model. Or ``id``, a date or an entry is mapped

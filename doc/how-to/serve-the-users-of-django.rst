@@ -62,15 +62,17 @@ A user model whose primary key is a UUID can do without the prefix:
 Choose the prefix before connecting the first identity provider. The identity providers keep the
 ``id`` of each resource, and changing the prefix changes every ``id``.
 
-Store externalId
-----------------
+Add a model beside the users and the groups
+-------------------------------------------
 
+The users and the groups have no field for ``externalId`` nor ``meta.lastModified``.
 ``externalId`` is an attribute of every resource (:rfc:`RFC 7643 §3.1 <7643#section-3.1>`), so
 ``/Schemas`` cannot tell clients the server does not store it. Without a field holding it, the
 server refuses a write carrying it with a ``400`` error. Okta sends it in every user it creates.
 
-Store it in a model beside the users, and one beside the groups, with a one-to-one relation
-whose ``related_name`` is the start of the path:
+Store these attributes in a model beside the users, and one beside the groups. Inherit from
+:class:`~scim2_django.auth.models.AbstractUserScim` and
+:class:`~scim2_django.auth.models.AbstractGroupScim`:
 
 .. literalinclude:: ../../examples/models.py
    :language: python
@@ -80,9 +82,42 @@ whose ``related_name`` is the start of the path:
    :language: python
    :pyobject: TeamScim
 
-Map ``externalId`` through the relation, as in ``user_mapping({"externalId":
-"scim__external_id"})``. These tables start empty: the storage creates the record of a user at the
-first ``externalId`` a client gives it.
+Create their tables with ``manage.py makemigrations`` and ``manage.py migrate``. The tables start
+empty, and nothing needs to fill them: a user without record beside it has no ``externalId``
+and no ``meta.lastModified``.
+
+:func:`~scim2_django.auth.user_mapping` and :func:`~scim2_django.auth.group_mapping` find these
+models through their one-to-one relation, and map the fields they keep: ``externalId``,
+``meta.lastModified``, and ``meta.created`` for the groups. Only the groups created through SCIM
+have a creation date. To leave out a field, set it to None in the model:
+
+.. code-block:: python
+
+   class AccountScim(AbstractUserScim):
+       last_modified = None
+
+Add ``scim2_django.auth`` to :setting:`INSTALLED_APPS`, so that a change outside SCIM changes
+``meta.lastModified`` too: a save of a user or a group, or a change of the groups of a user. A
+login changes nothing, unless Django upgrades the hash of the password. The records ``loaddata``
+loads keep the dates of the fixture, but the links between users and groups it sets date them.
+:meth:`~django.db.models.query.QuerySet.update`,
+:meth:`~django.db.models.query.QuerySet.bulk_update` and raw SQL send no signal, so
+``meta.lastModified`` misses their changes. ``meta.version`` does not: it is a hash of the
+resource.
+
+The models beside the users can hold other attributes, such as those of the enterprise
+extension. Add a field with null or a default, as the storage creates the record of a user at its
+first write, and map it through the relation:
+
+.. code-block:: python
+
+   users = user_mapping(
+       {f"{ENTERPRISE}:employeeNumber": "scim__employee_number"},
+       model=User[EnterpriseUser],
+   )
+
+A project with a user model of its own can rather add ``external_id`` to it, and map it as in
+``user_mapping({"externalId": "external_id"})``. The groups still need a model beside them.
 
 Connect Microsoft Entra ID
 --------------------------
@@ -96,7 +131,7 @@ Connect Okta
 ------------
 
 Okta finds the users it provisions by ``userName``, and sends ``externalId`` in every user it
-creates: store it, as in `Store externalId`_.
+creates: store it, as in `Add a model beside the users and the groups`_.
 
 Okta sends a password even when it does not synchronize the passwords. For a project whose users
 log in through the identity provider only, give every user an unusable password, whatever the

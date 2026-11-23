@@ -350,12 +350,11 @@ def _write_collections(
     now: Any,
     creating: bool,
 ) -> None:
-    """Write the related records, the entries and the links of a resource, once its record is saved.
+    """Write the entries, the links and the related records of a resource, once its record is saved.
 
     The entries of a Many replace the former ones, which are deleted. The
     links of a Link holding several entries replace the former links.
     """
-    _write_related(mapping, resource, record, now, creating)
     for collection in _written(mapping):
         if collection.owned:
             getattr(record, collection.accessor).all().delete()
@@ -366,6 +365,10 @@ def _write_collections(
             )
         elif not collection.single:
             getattr(record, collection.accessor).set(links[collection])
+
+    # The handlers of the changes of the links may write the related records
+    # too, so they are written last.
+    _write_related(mapping, resource, record, now, creating)
 
 
 def _write_related(
@@ -401,7 +404,13 @@ def _write_related(
             values.setdefault(column.relation, []).append((column, value))
 
     for relation, written in values.items():
-        related = _related_record(written[0][0], record)
+        # A handler of post_save may have created the related record since
+        # it was loaded.
+        related = (
+            relation.related_model._base_manager.using(record._state.db)
+            .filter(**{relation.field.name: record})
+            .first()
+        )
         if related is None:
             if all(value is None for _, value in written):
                 continue

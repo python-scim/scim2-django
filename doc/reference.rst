@@ -49,6 +49,10 @@ The mappings of the users of :setting:`AUTH_USER_MODEL` and of the groups of
 
 .. autofunction:: scim2_django.auth.group_mapping
 
+.. autoclass:: scim2_django.auth.models.AbstractUserScim
+
+.. autoclass:: scim2_django.auth.models.AbstractGroupScim
+
 .. _system-checks:
 
 System checks

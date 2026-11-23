@@ -37,8 +37,8 @@ def accept_anyone(request):
     return None
 
 
-users = user_mapping({"externalId": "scim__external_id"})
-groups = group_mapping({"externalId": "scim__external_id"})
+users = user_mapping()
+groups = group_mapping()
 provider = create_provider(users, groups)
 storage = DjangoStorage({"User": users, "Group": groups}, provider)
 site = ScimSite(storage, provider, name="accounts", authenticate=accept_anyone)

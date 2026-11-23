@@ -6,6 +6,7 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "django.contrib.sessions",
     "scim2_django",
+    "scim2_django.auth",
     "examples",
     "tests",
 ]

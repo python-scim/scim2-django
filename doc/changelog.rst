@@ -34,6 +34,11 @@ Added
   users of :setting:`AUTH_USER_MODEL` and the groups of :mod:`django.contrib.auth`, without any
   table. The ``id`` is the primary key after a prefix, the password is hashed by Django, and the
   version is a hash of the resource.
+- :class:`~scim2_django.auth.models.AbstractUserScim` and
+  :class:`~scim2_django.auth.models.AbstractGroupScim` add a model beside the users and the
+  groups, for ``externalId``, ``meta.lastModified`` and the attributes of the project. With
+  ``scim2_django.auth`` in :setting:`INSTALLED_APPS`, a change outside SCIM changes
+  ``meta.lastModified`` too.
 - ``meta.created`` and ``meta.lastModified`` are optional in a mapping. Without them, the
   resources have no such date.
 - The version field is optional in a mapping. Without it, ``meta.version`` is a hash of the whole

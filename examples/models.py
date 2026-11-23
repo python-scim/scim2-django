@@ -2,8 +2,10 @@
 
 import uuid
 
-from django.conf import settings
 from django.db import models
+
+from scim2_django.auth.models import AbstractGroupScim
+from scim2_django.auth.models import AbstractUserScim
 
 
 class Account(models.Model):
@@ -41,22 +43,9 @@ class Team(models.Model):
     revision = models.PositiveIntegerField(default=1)
 
 
-class AccountScim(models.Model):
+class AccountScim(AbstractUserScim):
     """What SCIM adds to the users of django.contrib.auth."""
 
-    user = models.OneToOneField(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        primary_key=True,
-        related_name="scim",
-    )
-    external_id = models.TextField(null=True, db_index=True)
 
-
-class TeamScim(models.Model):
+class TeamScim(AbstractGroupScim):
     """What SCIM adds to the groups of django.contrib.auth."""
-
-    group = models.OneToOneField(
-        "auth.Group", on_delete=models.CASCADE, primary_key=True, related_name="scim"
-    )
-    external_id = models.TextField(null=True, db_index=True)

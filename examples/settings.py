@@ -12,6 +12,7 @@ INSTALLED_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "scim2_django",
+    "scim2_django.auth",
     "examples",
 ]
 DATABASES = {

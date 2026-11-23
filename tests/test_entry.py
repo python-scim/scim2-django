@@ -77,14 +77,22 @@ def test_an_update_without_entry_empties_the_field(server):
         {"value": "bjensen@example.com"},
         {"value": "bjensen@example.com", "type": "Work"},
         {"value": "bjensen@example.com", "type": "work", "primary": True},
+        {"value": "bjensen@example.com", "type": "work", "primary": False},
     ],
-    ids=["without constants", "constant of another case", "every constant"],
+    ids=[
+        "without constants",
+        "constant of another case",
+        "every constant",
+        "not primary",
+    ],
 )
 def test_an_entry_may_leave_out_the_constants(server, entry):
-    """Entra sends emails[type eq "work"].value, without primary."""
+    """Entra sends emails[type eq "work"].value, without primary. The lone entry is the primary one."""
     user = create(server, "bjensen", [entry])
 
-    assert dump(user)[0]["value"] == "bjensen@example.com"
+    assert dump(user) == [
+        {"value": "bjensen@example.com", "type": "work", "primary": True}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -95,10 +103,9 @@ def test_an_entry_may_leave_out_the_constants(server, entry):
             "one entry at most",
         ),
         ([{"value": "bjensen@example.com", "type": "home"}], "can only be 'work'"),
-        ([work("bjensen@example.com", primary=False)], "can only be True"),
         ([work("bjensen@example.com", display="Babs")], "not stored"),
     ],
-    ids=["several entries", "another type", "not primary", "unmapped sub-attribute"],
+    ids=["several entries", "another type", "unmapped sub-attribute"],
 )
 def test_an_entry_the_fields_cannot_hold_is_refused(server, emails, message):
     with pytest.raises(InvalidValueException, match=message):

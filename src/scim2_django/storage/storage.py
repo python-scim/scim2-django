@@ -122,7 +122,9 @@ class DjangoStorage(ScimStorage):
     lost: :class:`~scim2_models.InvalidValueException` for an attribute no
     mapping stores, and :class:`~scim2_models.MutabilityException` for an
     attribute the mapping only reads. A value equal to the stored one is
-    accepted, so a resource read and sent back can always be written.
+    accepted, so a resource read and sent back can always be written. The
+    ``primary`` of the lone entry of an :class:`Entry` is the exception: it
+    accepts any value, and reads back as the primary one.
 
     The storage searches one resource type, or several at the root of the
     server as one collection. It pages by index, or with cursors that give

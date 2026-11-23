@@ -29,6 +29,10 @@ Added
   compare the value clients read, and a search by ``id`` uses the index of the field.
 - An :class:`~scim2_django.storage.Entry` stores a multi-valued attribute holding one entry at
   most in fields of the resource model, such as the ``emails`` of a user in its ``email`` field.
+- :func:`~scim2_django.auth.user_mapping` and :func:`~scim2_django.auth.group_mapping` serve the
+  users of :setting:`AUTH_USER_MODEL` and the groups of :mod:`django.contrib.auth`, without any
+  table. The ``id`` is the primary key after a prefix, the password is hashed by Django, and the
+  version is a hash of the resource.
 - ``meta.created`` and ``meta.lastModified`` are optional in a mapping. Without them, the
   resources have no such date.
 - The version field is optional in a mapping. Without it, ``meta.version`` is a hash of the whole

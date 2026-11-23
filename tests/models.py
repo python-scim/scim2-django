@@ -1,5 +1,6 @@
 import uuid
 
+from django.contrib.auth.models import AbstractBaseUser
 from django.db import models
 from django.db.models.functions import Lower
 
@@ -193,3 +194,23 @@ class Tag(models.Model):
 
     class Meta:
         ordering = ["id"]
+
+
+class Member(AbstractBaseUser):
+    """A user model whose user name is its email address, without names, and whose groups are not those of django.contrib.auth."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    email = models.EmailField(unique=True)
+    groups = models.ManyToManyField(GroupRecord, related_name="+")
+
+    USERNAME_FIELD = "email"
+    EMAIL_FIELD = "email"
+
+
+class Guest(AbstractBaseUser):
+    """A user model whose groups are those of django.contrib.auth, without a relation back."""
+
+    name = models.TextField(unique=True)
+    groups = models.ManyToManyField("auth.Group", related_name="+")
+
+    USERNAME_FIELD = "name"

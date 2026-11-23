@@ -564,7 +564,10 @@ def _check_entry_values(mapping: ResourceMapping, resource: Resource[Any]) -> No
 
 
 def _check_single_entries(mapping: ResourceMapping, resource: Resource[Any]) -> None:
-    """Refuse several entries for an Entry, or an entry with another value than one of its constants."""
+    """Refuse several entries for an Entry, or an entry with another type than its constant.
+
+    Any primary value is accepted: the lone entry is the primary one.
+    """
     for entry in mapping._entries.values():
         entries = _values(entry.binding, resource)
         if len(entries) > 1:
@@ -573,23 +576,18 @@ def _check_single_entries(mapping: ResourceMapping, resource: Resource[Any]) -> 
             )
 
         for item in entries:
-            for constant, column in entry.constants.values():
+            for name, (constant, column) in entry.constants.items():
+                if name == "primary":
+                    continue
+
                 value = _as_stored(
                     getattr(item, column.binding.target_field_name, None)
                 )
-                if value is not None and not _matches(column, value, constant):
+                if value is not None and value.casefold() != constant.casefold():
                     raise InvalidValueException(
                         detail=f"'{column.binding.urn}' can only be {constant!r} "
                         "on this server"
                     )
-
-
-def _matches(column: _Column, value: Any, constant: Any) -> bool:
-    """Tell whether a value is a constant, without their case for a string that is not case exact."""
-    if column.casefolded and isinstance(value, str):
-        return bool(value.casefold() == constant.casefold())
-
-    return bool(value == constant)
 
 
 def _check_enumerated(

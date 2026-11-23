@@ -39,6 +39,16 @@ and Django models.
 
 .. autoclass:: scim2_django.storage.Link
 
+Users of django.contrib.auth
+----------------------------
+
+The mappings of the users of :setting:`AUTH_USER_MODEL` and of the groups of
+:mod:`django.contrib.auth`. Read :doc:`how-to/serve-the-users-of-django`.
+
+.. autofunction:: scim2_django.auth.user_mapping
+
+.. autofunction:: scim2_django.auth.group_mapping
+
 .. _system-checks:
 
 System checks

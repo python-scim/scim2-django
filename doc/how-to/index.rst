@@ -12,7 +12,9 @@ Use these guides to fit a SCIM server into your Django project. They assume a
 - :doc:`serve-behind-a-proxy`, to make the URLs of the resources use the host and scheme the proxy
   received;
 - :doc:`limit-the-size-of-the-requests`, to protect the memory of the server;
-- :doc:`commit-the-changes`, to tie each SCIM operation to a database transaction.
+- :doc:`commit-the-changes`, to tie each SCIM operation to a database transaction;
+- :doc:`serve-the-users-of-django`, to let identity providers provision the users and the groups
+  of :mod:`django.contrib.auth`.
 
 The scim2-server guides cover what does not depend on Django: writing a storage, authorizing
 each operation, serving ``/Me`` and paging with cursors.
@@ -26,3 +28,4 @@ each operation, serving ``/Me`` and paging with cursors.
     serve-behind-a-proxy
     limit-the-size-of-the-requests
     commit-the-changes
+    serve-the-users-of-django

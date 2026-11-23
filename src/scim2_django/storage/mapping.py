@@ -221,8 +221,8 @@ class Entry:
         ``"work"``. A client may send it, and a write with another type is
         refused. Without it, the storage does not store ``type``.
     :param primary: The ``primary`` sub-attribute of the entry. A client may
-        send it, and a write with another value is refused. Without it, the
-        storage does not store ``primary``.
+        send any value, as the lone entry is the primary one, and reads this
+        one back. Without it, the storage does not store ``primary``.
     """
 
     def __init__(
@@ -701,8 +701,15 @@ class ResourceMapping:
         if storage is None:
             return None
 
-        if storage in (_Storage.written, _Storage.link_type, _Storage.constant):
+        if storage in (_Storage.written, _Storage.link_type):
             return attribute
+
+        if storage == _Storage.constant:
+            constant = self._constant_value(urn)
+            if not attribute.canonical_values:
+                return attribute
+
+            return attribute.model_copy(update={"canonical_values": [constant]})
 
         if storage == _Storage.ref:
             linked = self._linked_resource_types(urn)
@@ -775,6 +782,16 @@ class ResourceMapping:
                 return _Storage.read_only
 
         return None
+
+    def _constant_value(self, urn: str) -> Any:
+        """Return the constant an Entry gives the sub-attribute of a URN."""
+        key = urn.lower()
+        return next(
+            constant
+            for entry in self._entries.values()
+            for constant, column in entry.constants.values()
+            if column.binding.urn.lower() == key
+        )
 
     def _linked_resource_types(self, urn: str) -> list[str]:
         """Return the resource types the Links of an attribute link to, from the URN of its $ref."""

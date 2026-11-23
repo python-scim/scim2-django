@@ -9,6 +9,7 @@ from typing import Any
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.crypto import salted_hmac
 from pydantic import BaseModel
@@ -62,8 +63,12 @@ def _as_stored(value: Any) -> Any:
 
 
 def _get(column: _Column, record: Any) -> Any:
-    """Return the value a record holds for a column, None when the related record holding it does not exist."""
-    if column.relation is None:
+    """Return the value a record holds for a column, None when the related record holding it does not exist.
+
+    The record holds the value of an expression itself, even when the
+    expression reads a related record.
+    """
+    if column.relation is None or column.expression is not None:
         return getattr(record, column.key)
 
     related = _related_record(column, record)
@@ -133,12 +138,23 @@ def _to_scim(
     resource = model()
     special = (mapping._id, mapping._created, mapping._last_modified)
     for column in mapping._columns.values():
-        if column in special:
+        if column in special or column.in_entry:
             continue
 
         value = _read(column, record)
         if value is not None:
             Path[model](column.binding.urn).set(resource, value)  # type: ignore[valid-type]
+
+    for entry in mapping._entries.values():
+        values = {
+            column.binding.urn.rsplit(".", 1)[-1]: _read(column, record)
+            for column in entry.columns.values()
+        }
+        if any(value is not None for value in values.values()):
+            values |= {
+                name: constant for name, (constant, _) in entry.constants.items()
+            }
+            Path[model](entry.binding.urn).set(resource, [values])  # type: ignore[valid-type]
 
     read: dict[str, tuple[bool, list[Any]]] = {}
     for collection in collections:
@@ -194,11 +210,16 @@ def _related(collection: _Collection, record: Any) -> list[Any]:
 
 def _entries(collection: _Collection, resource: Resource[Any]) -> list[Any]:
     """Return the entries a resource holds for a collection, as a list even for a single one."""
-    value = Path(collection.binding.urn).get(resource, strict=False)
     if collection.single:
+        value = Path(collection.binding.urn).get(resource, strict=False)
         return [] if value is None else [value]
 
-    return list(value or [])
+    return _values(collection.binding, resource)
+
+
+def _values(binding: AttributeBinding, resource: Resource[Any]) -> list[Any]:
+    """Return the entries a resource holds for a multi-valued attribute."""
+    return list(Path(binding.urn).get(resource, strict=False) or [])
 
 
 def _read_entry(collection: _Collection, entry: Any, endpoint: str | None) -> Any:
@@ -235,30 +256,72 @@ def _from_scim(
 ) -> None:
     """Write the fields of a resource into a record, before the record is saved.
 
-    Read-only attributes are left as they are, and so is a write-only attribute
-    the resource has no value for, since a resource never carries it back.
-    When creating the record, a missing value is not written, so that the
-    field keeps its default. A Link holding one entry is a foreign key of the
-    record, so it is written here too. links holds the records each Link of
-    the resource links to.
+    Read-only attributes are left as they are. A Link holding one entry is a
+    foreign key of the record, so it is written here too. links holds the
+    records each Link of the resource links to.
     """
     for column in mapping._columns.values():
-        if not column.writable or column.relation is not None:
+        if not column.writable or column.relation is not None or column.in_entry:
             continue
 
         value = Path(column.binding.urn).get(resource, strict=False)
-        if value is None and (creating or not column.readable):
+        if value is None and _keeps(column, creating):
             continue
 
-        setattr(record, column.key, _stored(column, value))
+        setattr(record, column.field_key, _stored(column, value))
+
+    for entry in mapping._entries.values():
+        entries = _values(entry.binding, resource)
+        if not entry.writable or (creating and not entries):
+            continue
+
+        item = entries[0] if entries else None
+        for column in entry.columns.values():
+            value = getattr(item, column.binding.target_field_name, None)
+            if value is None and _keeps(column, creating):
+                continue
+
+            setattr(record, column.field_key, _stored(column, value))
 
     for collection in _written(mapping):
         if collection.single and not collection.owned:
             setattr(record, collection.accessor, next(iter(links[collection]), None))
 
 
+def _keeps(column: _Column, creating: bool) -> bool:
+    """Tell whether a missing value leaves a field as it is.
+
+    When creating the record, the field keeps its default, unless to_field
+    gives its value for no value. A write-only value is kept, since a resource
+    never carries it back.
+    """
+    if creating:
+        return not column.transformed
+
+    return not column.readable
+
+
 def _stored(column: _Column, value: Any) -> Any:
-    """Return the value a field stores for a SCIM value, an empty string for no value in a text field without null."""
+    """Return the value a field stores for a SCIM value, an empty string for no value in a text field without null.
+
+    A transformed field stores what to_field gives. The value is left out of
+    the error, as it may be a password.
+    """
+    if column.to_field is not None:
+        try:
+            stored = column.to_field(value)
+        except (TypeError, ValueError, ValidationError):
+            raise InvalidValueException(
+                detail=f"'{column.binding.urn}' cannot hold this value on this server"
+            ) from None
+
+        if stored is None and not column.field.null:  # type: ignore[union-attr]
+            raise InvalidValueException(
+                detail=f"'{column.binding.urn}' is required on this server"
+            )
+
+        return stored
+
     if value is None:
         return "" if column.empty_string else None
 
@@ -298,8 +361,9 @@ def _write_related(
     A related record is created at the first value it gets, so that a
     resource without such values gets no related record. A missing value is
     not written in a new related record, nor when creating the resource, so
-    that the field keeps its default. A new related record needs a value for
-    each mapped field without default.
+    that the field keeps its default, unless to_field gives its value for no
+    value. A new related record needs a value for each mapped field without
+    default.
     """
     values: dict[Any, list[tuple[_Column, Any]]] = {}
     for column in mapping._columns.values():
@@ -307,7 +371,7 @@ def _write_related(
             continue
 
         value = Path(column.binding.urn).get(resource, strict=False)
-        if value is None and (creating or not column.readable):
+        if value is None and _keeps(column, creating):
             continue
 
         values.setdefault(column.relation, []).append((column, value))
@@ -315,11 +379,14 @@ def _write_related(
     for relation, written in values.items():
         related = _related_record(written[0][0], record)
         if related is None:
-            written = [
-                (column, value) for column, value in written if value is not None
-            ]
-            if not written:
+            if all(value is None for _, value in written):
                 continue
+
+            written = [
+                (column, value)
+                for column, value in written
+                if value is not None or column.transformed
+            ]
 
             _check_creatable(mapping, relation, written)
             related = relation.related_model(**{relation.field.name: record})
@@ -407,6 +474,7 @@ def _check_storable(
     derived ones.
     """
     _check_entry_values(mapping, resource)
+    _check_single_entries(mapping, resource)
     model = type(resource)
     for path in Path[model].iter_paths():  # type: ignore[valid-type]
         binding = path.resolve()
@@ -433,7 +501,12 @@ def _check_storable(
             _check_written(mapping, binding, value, current, stored is None)
             continue
 
-        if storage in (_Storage.derived, _Storage.ref, _Storage.link_type) or value in (
+        if storage in (
+            _Storage.derived,
+            _Storage.ref,
+            _Storage.link_type,
+            _Storage.constant,
+        ) or value in (
             None,
             current,
         ):
@@ -487,6 +560,33 @@ def _check_entry_values(mapping: ResourceMapping, resource: Resource[Any]) -> No
                 if value is None and column.required:
                     raise InvalidValueException(
                         detail=f"'{column.binding.urn}' is required on this server"
+                    )
+
+
+def _check_single_entries(mapping: ResourceMapping, resource: Resource[Any]) -> None:
+    """Refuse several entries for an Entry, or an entry with another type than its constant.
+
+    Any primary value is accepted: the lone entry is the primary one.
+    """
+    for entry in mapping._entries.values():
+        entries = _values(entry.binding, resource)
+        if len(entries) > 1:
+            raise InvalidValueException(
+                detail=f"'{entry.binding.urn}' holds one entry at most on this server"
+            )
+
+        for item in entries:
+            for name, (constant, column) in entry.constants.items():
+                if name == "primary":
+                    continue
+
+                value = _as_stored(
+                    getattr(item, column.binding.target_field_name, None)
+                )
+                if value is not None and value.casefold() != constant.casefold():
+                    raise InvalidValueException(
+                        detail=f"'{column.binding.urn}' can only be {constant!r} "
+                        "on this server"
                     )
 
 

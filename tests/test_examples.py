@@ -1,4 +1,5 @@
 import pytest
+from django.core.management import call_command
 
 SCIM_JSON = "application/scim+json"
 ENTERPRISE_SCHEMA = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
@@ -122,3 +123,11 @@ def test_example_read_only_service_refuses_deletions(client):
     )
 
     assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_the_migrations_of_the_example_follow_its_models(settings):
+    """The tests create their tables without migrations, so this test checks that the migrations of the example create the tables of its models."""
+    settings.MIGRATION_MODULES = {}
+
+    call_command("makemigrations", "examples", "--check", "--dry-run")

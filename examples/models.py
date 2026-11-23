@@ -1,7 +1,8 @@
-"""The models of an intranet, before it serves SCIM."""
+"""The models of an intranet, before it serves SCIM, and the tables SCIM adds beside the users and the groups of django.contrib.auth."""
 
 import uuid
 
+from django.conf import settings
 from django.db import models
 
 
@@ -38,3 +39,24 @@ class Team(models.Model):
     created_at = models.DateTimeField()
     updated_at = models.DateTimeField()
     revision = models.PositiveIntegerField(default=1)
+
+
+class AccountScim(models.Model):
+    """What SCIM adds to the users of django.contrib.auth."""
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="scim",
+    )
+    external_id = models.TextField(null=True, db_index=True)
+
+
+class TeamScim(models.Model):
+    """What SCIM adds to the groups of django.contrib.auth."""
+
+    group = models.OneToOneField(
+        "auth.Group", on_delete=models.CASCADE, primary_key=True, related_name="scim"
+    )
+    external_id = models.TextField(null=True, db_index=True)

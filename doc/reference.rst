@@ -31,9 +31,23 @@ and Django models.
 
 .. autoclass:: scim2_django.storage.Computed
 
+.. autoclass:: scim2_django.storage.Transformed
+
 .. autoclass:: scim2_django.storage.Many
 
+.. autoclass:: scim2_django.storage.Entry
+
 .. autoclass:: scim2_django.storage.Link
+
+Users of django.contrib.auth
+----------------------------
+
+The mappings of the users of :setting:`AUTH_USER_MODEL` and of the groups of
+:mod:`django.contrib.auth`. Read :doc:`how-to/serve-the-users-of-django`.
+
+.. autofunction:: scim2_django.auth.user_mapping
+
+.. autofunction:: scim2_django.auth.group_mapping
 
 .. _system-checks:
 
@@ -73,12 +87,13 @@ The checks report the following errors and warnings:
    * - ``scim2_django.E007``
      - The entries of a :class:`~scim2_django.storage.Many` hold a write-only value, or a
        read-only value next to written ones. Each write replaces the entries, so these values
-       would be lost.
+       would be lost. Or a field of an :class:`~scim2_django.storage.Entry` is write-only, cannot
+       hold no value, or is read-only next to written ones: the entry could not be removed.
    * - ``scim2_django.E008``
      - A string attribute is mapped to a field or an expression that does not hold text.
    * - ``scim2_django.E009``
-     - The expression of a :class:`~scim2_django.storage.Computed` cannot be computed on the
-       model.
+     - The expression of a :class:`~scim2_django.storage.Computed` or a
+       :class:`~scim2_django.storage.Transformed` cannot be computed on the model.
    * - ``scim2_django.E010``
      - An attribute is mapped to a field of another model, other than through one reverse
        one-to-one relation of the resource model. Or ``id``, a date or an entry is mapped

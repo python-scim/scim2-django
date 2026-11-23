@@ -96,6 +96,7 @@ docstring-code-format = true
 
 [tool.coverage.run]
 source = ["scim2_django", "examples", "tests"]
+omit = ["examples/migrations/*"]
 branch = true
 
 [tool.mypy]
@@ -110,7 +111,7 @@ init_typed = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests", "doc"]
-addopts = "--doctest-glob='*.rst'"
+addopts = "--doctest-glob='*.rst' --no-migrations"
 doctest_optionflags = "ALLOW_UNICODE ELLIPSIS"
 DJANGO_SETTINGS_MODULE = "tests.settings"
 filterwarnings = ["error::scim2_tester.testing.ScimDeviationWarning"]

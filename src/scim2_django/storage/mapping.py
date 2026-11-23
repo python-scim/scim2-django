@@ -1,11 +1,15 @@
+import operator
 import weakref
+from collections.abc import Callable
 from collections.abc import Generator
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from dataclasses import replace
 from enum import Enum
+from functools import reduce
 from inspect import isclass
 from typing import Any
 
@@ -17,6 +21,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import DEFAULT_DB_ALIAS
 from django.db import models
 from django.db.models import CASCADE
+from django.db.models import Case
 from django.db.models import Exists
 from django.db.models import F
 from django.db.models import ForeignObjectRel
@@ -25,10 +30,12 @@ from django.db.models import OuterRef
 from django.db.models import Prefetch
 from django.db.models import Q
 from django.db.models import Value
+from django.db.models import When
 from django.db.models.functions import Cast
 from django.db.models.functions import Concat
 from django.db.models.functions import NullIf
 from django.db.models.functions import Substr
+from django.db.models.lookups import IsNull
 from django.urls import get_resolver
 from pydantic import BaseModel
 from scim2_models import Attribute as SchemaAttribute
@@ -83,7 +90,9 @@ class _Storage(Enum):
     a member, so writing it changes nothing. A ref is the $ref of a link,
     built from its value: clients may send it, and writing it changes nothing
     either. A link type is the type a Link gives its entries: clients may send
-    it, and the storage checks it against the linked resource.
+    it, and the storage checks it against the linked resource. A constant is a
+    sub-attribute an Entry gives its entry: clients may send it, and the
+    storage checks it against the constant.
     """
 
     written = "written"
@@ -91,6 +100,7 @@ class _Storage(Enum):
     derived = "derived"
     ref = "ref"
     link_type = "link type"
+    constant = "constant"
 
 
 class Attribute:
@@ -130,6 +140,47 @@ class Computed:
         self.expression = expression
 
 
+class Transformed:
+    """A field holding a SCIM attribute in another form, such as an identifier with a prefix, or the hash of a password.
+
+    The storage reads the value clients read through ``expression``, so that
+    filters and sorts compare it in the database. It writes the value clients
+    send through ``to_field``. The two must agree: ``to_field`` gives back the
+    field value ``expression`` was computed from.
+
+    An attribute without ``expression`` is write-only, such as a password. An
+    attribute without ``to_field`` is read-only. ``id`` needs both: the
+    storage finds a resource by its ``id`` through ``to_field``, so that the
+    database uses the index of the field.
+
+    :param field: The name of the field holding the value.
+    :param expression: The :doc:`query expression <django:ref/models/expressions>`
+        computing the value clients read from the field, such as
+        ``Concat(Value("u"), Cast("id", TextField()), output_field=TextField())``.
+    :param to_field: The function converting a value clients send into the
+        value of the field, such as
+        :func:`~django.contrib.auth.hashers.make_password`. It gets None for
+        no value, and when a resource is created without value. A
+        :exc:`ValueError`, a :exc:`TypeError` or a
+        :exc:`~django.core.exceptions.ValidationError` it raises refuses the
+        value, and so does None for a field without null.
+    """
+
+    def __init__(
+        self,
+        field: str,
+        *,
+        expression: Any = None,
+        to_field: Callable[[Any], Any] | None = None,
+    ) -> None:
+        if expression is None and to_field is None:
+            raise ValueError(f"Transformed({field!r}) needs expression or to_field")
+
+        self.field = field
+        self.expression = expression
+        self.to_field = to_field
+
+
 class Many:
     """The entries of a multi-valued attribute, stored in the records of another model.
 
@@ -153,6 +204,40 @@ class Many:
     def __init__(self, relation: str, attributes: Mapping[str, Any] | Any) -> None:
         self.relation = relation
         self.attributes = attributes
+
+
+class Entry:
+    """A multi-valued complex attribute holding one entry at most, stored in fields of the resource model.
+
+    Such as the email address of a user, in its ``email`` field. The
+    resource holds an entry when one of the fields has a value, so the fields
+    can hold no value: a write removing the entry empties them. A write with
+    several entries is refused.
+
+    :param attributes: The names of the fields of the resource model holding
+        the sub-attributes, by sub-attribute name, such as
+        ``{"value": "email"}``. A value may be an :class:`Attribute`.
+    :param type: The ``type`` sub-attribute of the entry, such as
+        ``"work"``. A client may send it, and a write with another type is
+        refused. Without it, the storage does not store ``type``.
+    :param primary: The ``primary`` sub-attribute of the entry. A client may
+        send any value, as the lone entry is the primary one, and reads this
+        one back. Without it, the storage does not store ``primary``.
+    """
+
+    def __init__(
+        self,
+        attributes: Mapping[str, str | Attribute],
+        *,
+        type: str | None = None,
+        primary: bool | None = None,
+    ) -> None:
+        self.attributes = attributes
+        self.constants = {
+            name: value
+            for name, value in (("type", type), ("primary", primary))
+            if value is not None
+        }
 
 
 class Link:
@@ -201,9 +286,14 @@ class _Column:
 
     key is the name of the field, or the alias the expression is annotated
     under. textual tells whether filters compare the field as text, as they do
-    for an integer identifier. relation is the reverse one-to-one relation
-    leading to the record holding the field, when the field is not one of the
-    resource record, as in "scim__external_id".
+    for an integer identifier. keyed tells whether filters find an
+    identifier by the value of its field, so that the database uses its
+    index. relation is the reverse one-to-one relation leading to the record
+    holding the field, when the field is not one of the resource record, as in
+    "scim__external_id".
+
+    A transformed field is read through its expression, under key, and
+    written through to_field, under field_key.
     """
 
     binding: AttributeBinding
@@ -214,6 +304,20 @@ class _Column:
     expression: Any = None
     textual: bool = False
     relation: Any = None
+    to_field: Callable[[Any], Any] | None = None
+    path: str | None = None
+    keyed: bool = False
+    in_entry: bool = False
+
+    @property
+    def field_key(self) -> str:
+        """The name of the field in lookups, which differs from key for a transformed field."""
+        return self.path or self.key
+
+    @property
+    def transformed(self) -> bool:
+        """Whether the field holds the values in another form than clients read and send."""
+        return self.path is not None
 
     @property
     def is_string(self) -> bool:
@@ -229,14 +333,29 @@ class _Column:
     def empty_string(self) -> bool:
         """Whether the field holds an empty string for no value.
 
-        Django text fields without null do so.
+        Django text fields without null do so. A transformed field holds what
+        to_field gives for no value.
         """
-        return self.is_string and self.field is not None and not self.field.null
+        return (
+            self.is_string
+            and self.field is not None
+            and not self.field.null
+            and not self.transformed
+        )
 
     @property
     def nullable(self) -> bool:
-        """Whether the field can hold no value. An expression is taken as nullable."""
-        return self.field is None or bool(self.field.null) or self.empty_string
+        """Whether the field can hold no value.
+
+        An expression is taken as nullable, and so is a transformed field,
+        which holds what to_field gives for no value.
+        """
+        return (
+            self.field is None
+            or self.transformed
+            or bool(self.field.null)
+            or self.empty_string
+        )
 
     @property
     def required(self) -> bool:
@@ -253,8 +372,11 @@ class _Column:
 
     @property
     def enumeration(self) -> list[Any] | None:
-        """The values a field with choices stores, or None for a field without choices."""
-        if self.field is None or not self.field.choices:
+        """The values a field with choices stores, or None for a field without choices.
+
+        A transformed field stores other values than clients send.
+        """
+        if self.field is None or self.transformed or not self.field.choices:
             return None
 
         return [value for value, _ in self.field.flatchoices]
@@ -408,6 +530,38 @@ class _Collection:
         return bool(mutability != Mutability.read_only)
 
 
+@dataclass(eq=False)
+class _Entry:
+    """A multi-valued complex attribute holding one entry at most, in fields of the resource record.
+
+    columns holds the columns of the mapped sub-attributes, and constants the
+    columns of the sub-attributes the entry always has, by sub-attribute
+    name. A constant column has no value when the entry does not exist.
+    """
+
+    binding: AttributeBinding
+    columns: dict[str, _Column]
+    constants: dict[str, tuple[Any, _Column]]
+    simple = False
+
+    @property
+    def writable(self) -> bool:
+        """Whether writing the resource writes the entry: its fields are all written, or all read-only."""
+        return any(column.writable for column in self.columns.values())
+
+    @property
+    def present(self) -> Q:
+        """The condition that the record has the entry: one of its sub-attributes has a value."""
+        return reduce(
+            operator.or_,
+            (Q(IsNull(column.compared, False)) for column in self.columns.values()),
+        )
+
+    def exists(self, condition: Q) -> Q:
+        """Return the condition that the entry exists and matches condition."""
+        return self.present & condition
+
+
 class ResourceMapping:
     """How the resources of a SCIM model are stored in the records of a Django model.
 
@@ -422,12 +576,13 @@ class ResourceMapping:
         ``User[EnterpriseUser]``.
     :param record: The Django model of the records.
     :param attributes: The attributes, by SCIM path. A value is the name of a
-        field, an :class:`Attribute`, a :class:`Computed`, a :class:`Many`, a
+        field, an :class:`Attribute`, a :class:`Computed`, a
+        :class:`Transformed`, a :class:`Many`, an :class:`Entry`, a
         :class:`Link`, or a list of :class:`Link`. A field of a model related
         by a reverse one-to-one relation, such as a table beside the users,
         is mapped with a path such as ``"scim__external_id"``. The storage
         creates the related record at the first value it writes there.
-        ``id`` is required.
+        ``id`` is required, and maps to a field or a :class:`Transformed`.
         ``meta.created`` and ``meta.lastModified`` are filled by the storage:
         without them, the resources have no such date.
     :param version: The name of an integer field counting the writes of each
@@ -464,6 +619,7 @@ class ResourceMapping:
         self._messages: list[checks.CheckMessage] | None = None
         self._columns: dict[tuple[type[BaseModel], str, str | None], _Column] = {}
         self._collections: dict[tuple[type[BaseModel], str], list[_Collection]] = {}
+        self._entries: dict[tuple[type[BaseModel], str], _Entry] = {}
 
         declared: dict[tuple[Any, ...], str] = {}
         for path, value in attributes.items():
@@ -548,6 +704,13 @@ class ResourceMapping:
         if storage in (_Storage.written, _Storage.link_type):
             return attribute
 
+        if storage == _Storage.constant:
+            constant = self._constant_value(urn)
+            if not attribute.canonical_values:
+                return attribute
+
+            return attribute.model_copy(update={"canonical_values": [constant]})
+
         if storage == _Storage.ref:
             linked = self._linked_resource_types(urn)
             return attribute.model_copy(update={"reference_types": linked})
@@ -608,7 +771,27 @@ class ResourceMapping:
             if key == f"{head}.type" and collection.link_type is not None:
                 return _Storage.link_type
 
+        for entry in self._entries.values():
+            for _, column in entry.constants.values():
+                if column.binding.urn.lower() != key:
+                    continue
+
+                if entry.writable:
+                    return _Storage.constant
+
+                return _Storage.read_only
+
         return None
+
+    def _constant_value(self, urn: str) -> Any:
+        """Return the constant an Entry gives the sub-attribute of a URN."""
+        key = urn.lower()
+        return next(
+            constant
+            for entry in self._entries.values()
+            for constant, column in entry.constants.values()
+            if column.binding.urn.lower() == key
+        )
 
     def _linked_resource_types(self, urn: str) -> list[str]:
         """Return the resource types the Links of an attribute link to, from the URN of its $ref."""
@@ -641,12 +824,21 @@ class ResourceMapping:
         """
         collections = self._collections.get((binding.model, binding.field_name))
         if collections is None:
-            return [(None, self._columns.get(_key(binding)))]
+            return [(None, self._columns.get(_key(binding)) or self._constant(binding))]
 
         return [
             (collection, collection.column(binding.sub_field_name))
             for collection in collections
         ]
+
+    def _constant(self, binding: AttributeBinding) -> _Column | None:
+        """Return the column of a sub-attribute an Entry gives its entry, or None."""
+        entry = self._entries.get((binding.model, binding.field_name))
+        if entry is None or binding.sub_field_name not in entry.constants:
+            return None
+
+        _, column = entry.constants[binding.sub_field_name]
+        return column
 
     def _nullable(self, urn: str) -> bool:
         """Tell whether the field of an attribute can hold no value, True for an attribute without field."""
@@ -682,6 +874,11 @@ class ResourceMapping:
             if column.is_string:
                 yield column
 
+        for entry in self._entries.values():
+            for _, column in entry.constants.values():
+                if column.is_string:
+                    yield column
+
         for collection in self._all_collections():
             for column in collection.columns.values():
                 if column.is_string:
@@ -694,10 +891,11 @@ class ResourceMapping:
         """Yield the readable and written columns whose values no two resources share.
 
         A column never written, such as id, cannot get a value another
-        resource holds.
+        resource holds. A column of an entry is left out, as a resource holds
+        its values in a list.
         """
         for column in self._columns.values():
-            if not (column.readable and column.writable):
+            if not (column.readable and column.writable) or column.in_entry:
                 continue
 
             if column.binding.get_annotation(Uniqueness) in (
@@ -785,15 +983,8 @@ class ResourceMapping:
                 if binding is None or column is None:
                     continue
 
-                collection.columns[binding.sub_field_name] = _Column(
-                    binding,
-                    column.key,
-                    column.readable,
-                    False,
-                    column.field,
-                    column.expression,
-                    column.textual,
-                    column.relation,
+                collection.columns[binding.sub_field_name] = replace(
+                    column, binding=binding, writable=False
                 )
 
     def _target(
@@ -859,6 +1050,11 @@ class ResourceMapping:
             self._declared[path] = (binding, value)
             return
 
+        if isinstance(value, Entry):
+            self._check_entry(path, binding, value, is_complex)
+            self._declared[path] = (binding, value)
+            return
+
         if isinstance(value, Link):
             value = [value]
 
@@ -885,6 +1081,18 @@ class ResourceMapping:
 
         self._check_value(path, binding)
         self._check_field_value(path, value)
+        if _key(binding) == _key(self._resolve("id")) and isinstance(
+            value, Transformed
+        ):
+            if value.expression is None or value.to_field is None:
+                raise ValueError(
+                    f"{path!r} is mapped to a Transformed, which needs an "
+                    "expression and to_field"
+                )
+
+            self._declared[path] = (binding, value)
+            return
+
         fields = {_key(self._resolve(path)) for path in self._FIELDS}
         if _key(binding) in fields and not isinstance(value, str):
             raise ValueError(f"{path!r} must be mapped to the name of a field")
@@ -924,22 +1132,66 @@ class ResourceMapping:
             self._check_value(f"{path}.{sub_path}", sub_binding)
             self._check_entry_value(f"{path}.{sub_path}", sub_value)
 
+    def _check_entry(
+        self, path: str, binding: AttributeBinding, entry: Entry, is_complex: bool
+    ) -> None:
+        """Check that an Entry fits a multi-valued complex attribute, maps fields of the record, and gives constants to sub-attributes it does not map."""
+        if (
+            binding.sub_field_name is not None
+            or not binding.is_multivalued
+            or not is_complex
+        ):
+            raise ValueError(
+                f"{path!r} is not a multi-valued complex attribute of "
+                f"{self.model.__name__}"
+            )
+
+        if not entry.attributes:
+            raise ValueError(f"The Entry of {path!r} maps no sub-attribute")
+
+        mapped = set()
+        for sub_path, sub_value in entry.attributes.items():
+            sub_binding = self._resolve(f"{path}.{sub_path}")
+            self._check_value(f"{path}.{sub_path}", sub_binding)
+            if not isinstance(sub_value, str | Attribute):
+                raise ValueError(
+                    f"{f'{path}.{sub_path}'!r} must be mapped to the name of a "
+                    "field, or an Attribute"
+                )
+
+            field = sub_value if isinstance(sub_value, str) else sub_value.field
+            if "__" in field:
+                raise ValueError(
+                    f"{f'{path}.{sub_path}'!r} is held by a field of the resource "
+                    "model, not of a related model"
+                )
+
+            mapped.add(_key(sub_binding))
+
+        for name in entry.constants:
+            given = self._find(f"{path}.{name}")
+            if given is None or _key(given) in mapped:
+                raise ValueError(
+                    f"The Entry of {path!r} gives {name!r}, which is not a "
+                    "sub-attribute it leaves unmapped"
+                )
+
     def _check_entry_value(self, path: str, value: Any) -> None:
         """Refuse a value of an entry that is not the name of a field, or an Attribute."""
-        if isinstance(value, Computed):
+        if isinstance(value, Computed | Transformed):
             raise ValueError(
                 f"{path!r} is held by the entries of another model, "
-                "which cannot be computed"
+                "which cannot be computed nor transformed"
             )
 
         self._check_field_value(path, value)
 
     def _check_field_value(self, path: str, value: Any) -> None:
-        """Refuse a value that is not the name of a field, an Attribute, or a Computed."""
-        if not isinstance(value, str | Attribute | Computed):
+        """Refuse a value that is not the name of a field, an Attribute, a Computed, or a Transformed."""
+        if not isinstance(value, str | Attribute | Computed | Transformed):
             raise ValueError(
                 f"{path!r} must be mapped to the name of a field, an Attribute, "
-                "or a Computed"
+                "a Computed, or a Transformed"
             )
 
     def _check_value(self, path: str, binding: AttributeBinding) -> None:
@@ -973,6 +1225,12 @@ class ResourceMapping:
                 collection = yield from self._many(path, binding, value)
                 if collection is not None:
                     self._collections[key] = [collection]
+            elif isinstance(value, Entry):
+                entry = yield from self._entry(path, binding, value)
+                if entry is not None:
+                    self._entries[key] = entry
+                    for entry_column in entry.columns.values():
+                        self._columns[_key(entry_column.binding)] = entry_column
             elif isinstance(value, list):
                 collections = yield from self._links(path, binding, value)
                 if collections is not None:
@@ -990,7 +1248,10 @@ class ResourceMapping:
             return
 
         self._id = self._column("id")
-        self._id.textual = not isinstance(self._id.field, _TEXT_FIELDS)
+        self._id.textual = not (
+            self._id.transformed or isinstance(self._id.field, _TEXT_FIELDS)
+        )
+        self._id.keyed = self._id.textual or self._id.transformed
         self._created = self._columns.get(_key(self._resolve("meta.created")))
         self._last_modified = self._columns.get(
             _key(self._resolve("meta.lastModified"))
@@ -1074,47 +1335,38 @@ class ResourceMapping:
         readable = Mutability.write_only not in mutabilities
         writable = Mutability.read_only not in mutabilities
         if isinstance(value, Computed):
-            alias = "scim_" + binding.urn.replace(":", "_").replace(".", "_")
+            alias = _alias(binding)
             output = yield from self._output_field(path, alias, value.expression)
             if output is None:
                 return None
 
-            column = _Column(binding, alias, True, False, expression=value.expression)
-            if column.is_string and not _holds_text(output):
+            computed = _Column(binding, alias, True, False, expression=value.expression)
+            if computed.is_string and not _holds_text(output):
                 yield self._not_text(path, "its expression")
                 return None
 
-            return column
+            return computed
+
+        if isinstance(value, Transformed):
+            return (
+                yield from self._transformed(
+                    model, path, binding, value, readable, writable
+                )
+            )
 
         attribute = value if isinstance(value, Attribute) else Attribute(value)
-        relation, name = None, attribute.field
-        if "__" in attribute.field:
-            relation = yield from self._relation(model, path, binding, attribute.field)
-            if relation is None:
-                return None
-
-            model, name = relation.related_model, attribute.field.partition("__")[2]
-
-        field = yield from self._field(model, name, path)
-        if field is None:
-            return None
-
-        if field.is_relation or not field.concrete:
-            yield self._error(
-                f"{path!r} is mapped to {attribute.field!r}, which is a relation: "
-                "map it with Many or Link",
-                "scim2_django.E002",
-            )
-            return None
-
-        column = _Column(
+        column = yield from self._field_column(
+            model,
+            path,
             binding,
             attribute.field,
             attribute.readable and readable,
-            attribute.writable and writable and not field.generated,
-            field,
-            relation=relation,
+            attribute.writable and writable,
         )
+        if column is None:
+            return None
+
+        field: Any = column.field
         if not column.is_string or _key(binding) == _key(self._resolve("id")):
             return column
 
@@ -1131,6 +1383,86 @@ class ResourceMapping:
                 id="scim2_django.W001",
             )
 
+        return column
+
+    def _field_column(
+        self,
+        model: type[models.Model],
+        path: str,
+        binding: AttributeBinding,
+        name: str,
+        readable: bool,
+        writable: bool,
+    ) -> Generator[checks.CheckMessage, None, _Column | None]:
+        """Build the column of a field, of the record or of a record related by a reverse one-to-one relation.
+
+        A generated field is never written.
+        """
+        relation, field_name = None, name
+        if "__" in name:
+            relation = yield from self._relation(model, path, binding, name)
+            if relation is None:
+                return None
+
+            model, field_name = relation.related_model, name.partition("__")[2]
+
+        field = yield from self._field(model, field_name, path)
+        if field is None:
+            return None
+
+        if field.is_relation or not field.concrete:
+            yield self._error(
+                f"{path!r} is mapped to {name!r}, which is a relation: "
+                "map it with Many or Link",
+                "scim2_django.E002",
+            )
+            return None
+
+        return _Column(
+            binding,
+            name,
+            readable,
+            writable and not field.generated,
+            field,
+            relation=relation,
+        )
+
+    def _transformed(
+        self,
+        model: type[models.Model],
+        path: str,
+        binding: AttributeBinding,
+        transformed: Transformed,
+        readable: bool,
+        writable: bool,
+    ) -> Generator[checks.CheckMessage, None, _Column | None]:
+        """Build the column of a transformed field, read through its expression and written through to_field."""
+        column = yield from self._field_column(
+            model,
+            path,
+            binding,
+            transformed.field,
+            readable and transformed.expression is not None,
+            writable and transformed.to_field is not None,
+        )
+        if column is None:
+            return None
+
+        column.path = transformed.field
+        column.to_field = transformed.to_field
+        if not column.readable:
+            return column
+
+        alias = _alias(binding)
+        output = yield from self._output_field(path, alias, transformed.expression)
+        if output is None:
+            return None
+
+        if column.is_string and not _holds_text(output):
+            yield self._not_text(path, "its expression")
+            return None
+
+        column.key, column.expression = alias, transformed.expression
         return column
 
     def _relation(
@@ -1270,6 +1602,65 @@ class ResourceMapping:
         yield from self._check_entries(path, collection)
         return collection
 
+    def _entry(
+        self, path: str, binding: AttributeBinding, entry: Entry
+    ) -> Generator[checks.CheckMessage, None, _Entry | None]:
+        """Build the columns of an Entry: those of its fields, and those of its constants.
+
+        A constant has a value when the entry exists only.
+        """
+        columns: dict[str, _Column] = {}
+        for sub_path, value in entry.attributes.items():
+            sub_binding = self._resolve(f"{path}.{sub_path}")
+            column = yield from self._build_column(
+                self.record, f"{path}.{sub_path}", sub_binding, value
+            )
+            if column is None:
+                return None
+
+            columns[sub_binding.sub_field_name] = column  # type: ignore[index]
+
+        for column in columns.values():
+            column.in_entry = True
+
+        values = columns.values()
+        if not all(column.readable and column.nullable for column in values):
+            yield self._error(
+                f"The entry of {path!r} exists when one of its fields has a "
+                "value, and a write removing it empties them, so they cannot "
+                "be write-only nor without null",
+                "scim2_django.E007",
+            )
+            return None
+
+        writable = [column.writable for column in values]
+        if any(writable) and not all(writable):
+            yield self._error(
+                f"A write removing the entry of {path!r} empties its fields, so "
+                "they cannot hold a read-only value next to written ones",
+                "scim2_django.E007",
+            )
+            return None
+
+        result = _Entry(binding, columns, {})
+        for name, constant in entry.constants.items():
+            sub_binding = self._resolve(f"{path}.{name}")
+            expression = Case(
+                When(result.present, then=Value(constant)),
+                default=Value(None),
+                output_field=(
+                    models.BooleanField()
+                    if isinstance(constant, bool)
+                    else models.TextField()
+                ),
+            )
+            result.constants[name] = (
+                constant,
+                _Column(sub_binding, name, True, False, expression=expression),
+            )
+
+        return result
+
     def _check_entries(
         self, path: str, collection: _Collection
     ) -> Iterator[checks.CheckMessage]:
@@ -1349,6 +1740,11 @@ class ResourceMapping:
             collections.append(collection)
 
         return collections
+
+
+def _alias(binding: AttributeBinding) -> str:
+    """Return the alias records hold the value of an expression under."""
+    return "scim_" + binding.urn.replace(":", "_").replace(".", "_")
 
 
 def _key(binding: AttributeBinding) -> tuple[Any, ...]:

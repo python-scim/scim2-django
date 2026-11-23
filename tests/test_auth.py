@@ -17,6 +17,7 @@ from scim2_tester import Status
 from scim2_tester.testing import ScimServerContract
 
 from examples.accounts import create_provider
+from examples.models import AccountScim
 from scim2_django.auth import group_mapping
 from scim2_django.auth import user_mapping
 from scim2_django.storage import DjangoStorage
@@ -110,7 +111,7 @@ def test_a_user_holds_the_fields_of_the_user_model(server):
     )
     assert (record.email, record.is_active) == ("bjensen@example.com", False)
     assert user.meta.created == record.date_joined
-    assert user.meta.last_modified is None
+    assert user.meta.last_modified == AccountScim.objects.get().last_modified
     assert user.emails[0].primary is True
 
 

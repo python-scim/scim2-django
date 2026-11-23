@@ -1,6 +1,7 @@
 import uuid
 
 from django.contrib.auth.models import AbstractBaseUser
+from django.contrib.auth.models import Group as AuthGroup
 from django.db import models
 from django.db.models.functions import Lower
 
@@ -59,6 +60,8 @@ class UserScim(models.Model):
     external_id = models.TextField(null=True)
     division = models.TextField(blank=True)
     level = models.IntegerField(default=0)
+    created = models.DateTimeField(null=True)
+    last_modified = models.DateTimeField(null=True)
 
 
 class UserCard(models.Model):
@@ -69,6 +72,7 @@ class UserCard(models.Model):
     )
     number = models.IntegerField()
     note = models.TextField(null=True)
+    issued = models.DateTimeField(null=True)
 
 
 class UserBadge(models.Model):
@@ -214,3 +218,41 @@ class Guest(AbstractBaseUser):
     groups = models.ManyToManyField("auth.Group", related_name="+")
 
     USERNAME_FIELD = "name"
+
+
+class GuestScim(models.Model):
+    """What SCIM adds to the guests, without the modification date."""
+
+    scim2_resource_type = "User"
+
+    guest = models.OneToOneField(
+        Guest, on_delete=models.CASCADE, primary_key=True, related_name="scim"
+    )
+    external_id = models.TextField(null=True)
+
+
+class Twin(AbstractBaseUser):
+    """A user model with two models beside it."""
+
+    name = models.TextField(unique=True)
+
+    USERNAME_FIELD = "name"
+
+
+class LeftTwinScim(models.Model):
+    scim2_resource_type = "User"
+
+    twin = models.OneToOneField(Twin, on_delete=models.CASCADE, related_name="left")
+
+
+class RightTwinScim(models.Model):
+    scim2_resource_type = "User"
+
+    twin = models.OneToOneField(Twin, on_delete=models.CASCADE, related_name="right")
+
+
+class Team(AuthGroup):
+    """The groups of django.contrib.auth, as the admin of a project may show them."""
+
+    class Meta:
+        proxy = True

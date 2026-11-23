@@ -279,12 +279,8 @@ class DjangoStorage(ScimStorage):
             links = self._links(mapping, resource)
             record = mapping.record()
             now = _now()
-            for column in (mapping._created, mapping._last_modified):
-                if column is not None:
-                    setattr(record, column.key, now)
-
-            _from_scim(mapping, resource, record, links, creating=True)
-            self._save(mapping, resource, record, links, None)
+            _from_scim(mapping, resource, record, links, now, creating=True)
+            self._save(mapping, resource, record, links, now, None)
 
         records = mapping._queryset(mapping._returned_collections(), self.using)
         return self._to_scim(resource_type, records.get(pk=record.pk))
@@ -314,11 +310,9 @@ class DjangoStorage(ScimStorage):
             self._check_uniqueness(mapping, resource, stored)
             links = self._links(mapping, resource)
             self._count_write(mapping, record)
-            _from_scim(mapping, resource, record, links, creating=False)
-            if mapping._last_modified is not None:
-                setattr(record, mapping._last_modified.key, _now())
-
-            self._save(mapping, resource, record, links, stored)
+            now = _now()
+            _from_scim(mapping, resource, record, links, now, creating=False)
+            self._save(mapping, resource, record, links, now, stored)
 
         return self.get(resource_type, resource.id)  # type: ignore[arg-type]
 
@@ -531,9 +525,10 @@ class DjangoStorage(ScimStorage):
         resource: Resource[Any],
         record: Any,
         links: dict[_Collection, list[Any]],
+        now: Any,
         stored: Resource[Any] | None,
     ) -> None:
-        """Save a record and its collections. stored is the stored resource, None for a new one.
+        """Save a record and its collections, at the date now. stored is the stored resource, None for a new one.
 
         On an integrity error, the uniqueness is checked again, so that a
         unique value taken in the meantime raises a 409.
@@ -542,7 +537,7 @@ class DjangoStorage(ScimStorage):
             with transaction.atomic(using=self.using):
                 record.save(using=self.using)
                 _write_collections(
-                    mapping, resource, record, links, creating=stored is None
+                    mapping, resource, record, links, now, creating=stored is None
                 )
         except IntegrityError:
             self._check_uniqueness(mapping, resource, stored)

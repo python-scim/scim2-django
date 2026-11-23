@@ -23,7 +23,8 @@ Added
 - ``manage.py check`` checks the fields of every mapping.
 - An attribute can be stored in a model related by a reverse one-to-one relation, such as a table
   beside the users, with a path such as ``"scim__external_id"``. The storage creates the related
-  record at its first value.
+  record at its first value. ``meta.created`` and ``meta.lastModified`` can be stored there too:
+  each write then creates the related record.
 - A :class:`~scim2_django.storage.Transformed` field holds an attribute in another form, such as
   an ``id`` made of a prefix and the primary key, or the hash of a password. Filters and sorts
   compare the value clients read, and a search by ``id`` uses the index of the field.
@@ -33,6 +34,11 @@ Added
   users of :setting:`AUTH_USER_MODEL` and the groups of :mod:`django.contrib.auth`, without any
   table. The ``id`` is the primary key after a prefix, the password is hashed by Django, and the
   version is a hash of the resource.
+- :class:`~scim2_django.auth.models.AbstractUserScim` and
+  :class:`~scim2_django.auth.models.AbstractGroupScim` add a model beside the users and the
+  groups, for ``externalId``, ``meta.lastModified`` and the attributes of the project. With
+  ``scim2_django.auth`` in :setting:`INSTALLED_APPS`, a change outside SCIM changes
+  ``meta.lastModified`` too.
 - ``meta.created`` and ``meta.lastModified`` are optional in a mapping. Without them, the
   resources have no such date.
 - The version field is optional in a mapping. Without it, ``meta.version`` is a hash of the whole

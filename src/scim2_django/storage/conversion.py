@@ -252,14 +252,20 @@ def _from_scim(
     resource: Resource[Any],
     record: Any,
     links: dict[_Collection, list[Any]],
+    now: Any,
     creating: bool,
 ) -> None:
     """Write the fields of a resource into a record, before the record is saved.
 
-    Read-only attributes are left as they are. A Link holding one entry is a
-    foreign key of the record, so it is written here too. links holds the
-    records each Link of the resource links to.
+    Read-only attributes are left as they are. The dates of the record are
+    set to now. A Link holding one entry is a foreign key of the record, so it
+    is written here too. links holds the records each Link of the resource links
+    to.
     """
+    for column, value in _dates(mapping, now, creating):
+        if column.relation is None:
+            setattr(record, column.field_key, value)
+
     for column in mapping._columns.values():
         if not column.writable or column.relation is not None or column.in_entry:
             continue
@@ -286,6 +292,14 @@ def _from_scim(
     for collection in _written(mapping):
         if collection.single and not collection.owned:
             setattr(record, collection.accessor, next(iter(links[collection]), None))
+
+
+def _dates(
+    mapping: ResourceMapping, now: Any, creating: bool
+) -> list[tuple[_Column, Any]]:
+    """Return the date columns set to the current time: the modification date, and the creation date when creating."""
+    columns = [mapping._last_modified, mapping._created if creating else None]
+    return [(column, now) for column in columns if column is not None]
 
 
 def _keeps(column: _Column, creating: bool) -> bool:
@@ -333,14 +347,14 @@ def _write_collections(
     resource: Resource[Any],
     record: Any,
     links: dict[_Collection, list[Any]],
+    now: Any,
     creating: bool,
 ) -> None:
-    """Write the related records, the entries and the links of a resource, once its record is saved.
+    """Write the entries, the links and the related records of a resource, once its record is saved.
 
     The entries of a Many replace the former ones, which are deleted. The
     links of a Link holding several entries replace the former links.
     """
-    _write_related(mapping, resource, record, creating)
     for collection in _written(mapping):
         if collection.owned:
             getattr(record, collection.accessor).all().delete()
@@ -352,18 +366,27 @@ def _write_collections(
         elif not collection.single:
             getattr(record, collection.accessor).set(links[collection])
 
+    # The handlers of the changes of the links may write the related records
+    # too, so they are written last.
+    _write_related(mapping, resource, record, now, creating)
+
 
 def _write_related(
-    mapping: ResourceMapping, resource: Resource[Any], record: Any, creating: bool
+    mapping: ResourceMapping,
+    resource: Resource[Any],
+    record: Any,
+    now: Any,
+    creating: bool,
 ) -> None:
     """Write the fields of a resource that related records hold, once its record is saved.
 
-    A related record is created at the first value it gets, so that a
-    resource without such values gets no related record. A missing value is
-    not written in a new related record, nor when creating the resource, so
-    that the field keeps its default, unless to_field gives its value for no
-    value. A new related record needs a value for each mapped field without
-    default.
+    A related record is created when it holds a date, or gets a value. Without
+    dates, a resource without such values gets no related record.
+
+    A missing value is not written in a new related record, nor when creating
+    the resource, so that the field keeps its default, unless to_field gives
+    its value for no value. A new related record needs a value for each mapped
+    field without default.
     """
     values: dict[Any, list[tuple[_Column, Any]]] = {}
     for column in mapping._columns.values():
@@ -376,8 +399,18 @@ def _write_related(
 
         values.setdefault(column.relation, []).append((column, value))
 
+    for column, value in _dates(mapping, now, creating):
+        if column.relation is not None:
+            values.setdefault(column.relation, []).append((column, value))
+
     for relation, written in values.items():
-        related = _related_record(written[0][0], record)
+        # A handler of post_save may have created the related record since
+        # it was loaded.
+        related = (
+            relation.related_model._base_manager.using(record._state.db)
+            .filter(**{relation.field.name: record})
+            .first()
+        )
         if related is None:
             if all(value is None for _, value in written):
                 continue

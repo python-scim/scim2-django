@@ -1471,12 +1471,11 @@ class ResourceMapping:
         """Return the reverse one-to-one relation a field name leads through, yielding an error for any other path.
 
         Only a field of the resource record leads through a relation, and only
-        an attribute the storage does not fill itself.
+        for another attribute than id.
         """
         relation_name, _, field_name = name.partition("__")
-        fields = {_key(self._resolve(path)) for path in self._FIELDS}
         relation = None
-        if model is self.record and _key(binding) not in fields:
+        if model is self.record and _key(binding) != _key(self._resolve("id")):
             relation = yield from self._field(model, relation_name, path)
             if relation is None:
                 return None
@@ -1489,7 +1488,7 @@ class ResourceMapping:
             yield self._error(
                 f"{path!r} is mapped to {name!r}: a field of another model is "
                 "reached through one reverse one-to-one relation of the resource "
-                "model, for an attribute the storage does not fill itself",
+                "model, for another attribute than id",
                 "scim2_django.E010",
             )
             return None
@@ -1517,6 +1516,32 @@ class ResourceMapping:
                         "a default",
                         "scim2_django.E010",
                     )
+
+        yield from self._check_dated()
+
+    def _check_dated(self) -> Iterator[checks.CheckMessage]:
+        """Refuse a related model holding a date and a mapped field that needs a value.
+
+        The storage writes the dates on each write, so each write creates the
+        related record, even when the client gives no value for that field.
+        """
+        dates = {_key(self._resolve(path)) for path in self._FIELDS}
+        dated = {
+            column.relation
+            for column in self._columns.values()
+            if column.relation is not None and _key(column.binding) in dates
+        }
+        for column in self._columns.values():
+            if column.relation not in dated or _key(column.binding) in dates:
+                continue
+
+            if not column.nullable and _needs_value(column.field):  # type: ignore[arg-type]
+                yield self._error(
+                    f"{column.relation.get_accessor_name()!r} leads to records "
+                    "holding dates, which each write creates, so the field of "
+                    f"{column.binding.urn!r} needs null or a default",
+                    "scim2_django.E010",
+                )
 
     def _relations(self) -> list[Any]:
         """Return the relations leading to the records holding mapped fields, by name."""

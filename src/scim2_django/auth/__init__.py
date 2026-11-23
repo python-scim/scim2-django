@@ -2,13 +2,15 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from typing import Any
 
-from django.apps import apps
+from django.apps import apps as registry
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import FieldDoesNotExist
-from django.db import models
+from django.core.exceptions import ImproperlyConfigured
+from django.db.models import Model
 from django.db.models import TextField
+from django.db.models import UUIDField
 from django.db.models import Value
 from django.db.models.functions import Cast
 from django.db.models.functions import Concat
@@ -16,11 +18,11 @@ from scim2_models import Group
 from scim2_models import Resource
 from scim2_models import User
 
-from .storage import Entry
-from .storage import Link
-from .storage import ResourceMapping
-from .storage import Transformed
-from .storage.mapping import _UUIDText
+from ..storage import Entry
+from ..storage import Link
+from ..storage import ResourceMapping
+from ..storage import Transformed
+from ..storage.mapping import _UUIDText
 
 
 def user_mapping(
@@ -86,6 +88,11 @@ def user_mapping(
     if _groups(record) is not None:
         mapped["groups"] = Link("groups", "Group", type="direct")
 
+    mapped |= _beside(
+        record,
+        "User",
+        {"externalId": "external_id", "meta.lastModified": "last_modified"},
+    )
     return _mapping(model, record, mapped, attributes)
 
 
@@ -116,7 +123,7 @@ def group_mapping(
         changing it changes every ``id``.
     :returns: The mapping of the groups, as the resource type ``Group``.
     """
-    record = apps.get_model("auth", "Group")
+    record = registry.get_model("auth", "Group")
     mapped: dict[str, Any] = {
         "id": _identifier(record, prefix),
         "displayName": "name",
@@ -125,12 +132,21 @@ def group_mapping(
     if groups is not None and not groups.remote_field.hidden:
         mapped["members"] = Link(groups.related_query_name(), "User", type="User")
 
+    mapped |= _beside(
+        record,
+        "Group",
+        {
+            "externalId": "external_id",
+            "meta.created": "created",
+            "meta.lastModified": "last_modified",
+        },
+    )
     return _mapping(model, record, mapped, attributes)
 
 
 def _mapping(
     model: type[Resource[Any]],
-    record: type[models.Model],
+    record: type[Model],
     mapped: dict[str, Any],
     attributes: Mapping[str, Any] | None,
 ) -> ResourceMapping:
@@ -158,7 +174,48 @@ def _overlap(path: str, other: str) -> bool:
     return path == other or path.startswith(f"{other}.") or other.startswith(f"{path}.")
 
 
-def _field(record: type[models.Model], name: str) -> Any:
+def _beside(
+    record: type[Model], resource_type: str, fields: Mapping[str, str]
+) -> dict[str, str]:
+    """Return the paths of the attributes the model beside the records holds, among fields, by SCIM path.
+
+    A model without model beside it holds none.
+    """
+    relation = _relation_beside(record, resource_type)
+    if relation is None:
+        return {}
+
+    return {
+        path: f"{relation.name}__{name}"
+        for path, name in fields.items()
+        if _field(relation.related_model, name) is not None
+    }
+
+
+def _relation_beside(record: type[Model], resource_type: str) -> Any:
+    """Return the reverse one-to-one relation from the records to the model beside them, or None when there is none.
+
+    The model beside them inherits from the abstract model of the resource
+    type, which tells it by its scim2_resource_type. Several models beside
+    the records raise ImproperlyConfigured.
+    """
+    relations = [
+        relation
+        for relation in record._meta.related_objects
+        if relation.one_to_one
+        and getattr(relation.related_model, "scim2_resource_type", None)
+        == resource_type
+    ]
+    if len(relations) > 1:
+        names = ", ".join(sorted(r.related_model._meta.label for r in relations))
+        raise ImproperlyConfigured(
+            f"Several models are beside the records of {record._meta.label}: {names}"
+        )
+
+    return next(iter(relations), None)
+
+
+def _field(record: type[Model], name: str) -> Any:
     """Return the field of a model, or None when the model has none of that name."""
     try:
         return record._meta.get_field(name)
@@ -166,23 +223,23 @@ def _field(record: type[models.Model], name: str) -> Any:
         return None
 
 
-def _groups(record: type[models.Model]) -> Any:
+def _groups(record: type[Model]) -> Any:
     """Return the relation from the users to the groups of django.contrib.auth, or None when the user model has none."""
     field = _field(record, "groups")
-    if field is None or field.related_model is not apps.get_model("auth", "Group"):
+    if field is None or field.related_model is not registry.get_model("auth", "Group"):
         return None
 
     return field
 
 
-def _identifier(record: type[models.Model], prefix: str) -> Any:
+def _identifier(record: type[Model], prefix: str) -> Any:
     """Return the mapping of the id: the primary key, after the prefix."""
     key = record._meta.pk.name
     if not prefix:
         return key
 
     text: Any = Cast(key, TextField())
-    if isinstance(record._meta.pk, models.UUIDField):
+    if isinstance(record._meta.pk, UUIDField):
         text = _UUIDText(key)
 
     expression = Concat(Value(prefix), text, output_field=TextField())

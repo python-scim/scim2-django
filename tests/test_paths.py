@@ -186,7 +186,6 @@ def mapping(value, path="externalId"):
         ("externalId", "emails__value"),
         ("externalId", "scim__user__user_name"),
         ("id", "scim__user_id"),
-        ("meta.created", "scim__level"),
     ],
     ids=[
         "foreign key",
@@ -194,7 +193,6 @@ def mapping(value, path="externalId"):
         "reverse foreign key",
         "two relations",
         "id",
-        "date",
     ],
 )
 def test_a_field_of_another_model_is_reached_through_one_reverse_one_to_one(
@@ -323,3 +321,96 @@ def test_a_relation_is_queried_by_its_query_name():
 
     assert [r.id for r in page.resources] == [user.id]
     assert server.storage.get(server.users, user.id).nick_name == "Babs"
+
+
+DATED = {"meta.created": "scim__created", "meta.lastModified": "scim__last_modified"}
+"""Dates stored in the table beside the users."""
+
+
+def test_a_new_user_gets_its_dates_beside_it():
+    """The dates make each write create the record beside the user."""
+    server = Server(mappings={"User": users_mapping(DATED)})
+
+    user = create(server, user_name="bjensen")
+
+    scim = UserScim.objects.get()
+    assert user.meta.created == scim.created == scim.last_modified
+    assert user.meta.last_modified == scim.last_modified
+
+
+def test_an_update_dates_the_record_beside_the_user_it_creates():
+    """A user created outside SCIM has no creation date: its first SCIM write creates the record beside it."""
+    server = Server(mappings={"User": users_mapping(DATED)})
+    record = UserRecord.objects.create(user_name="bjensen", preferred_language="fr")
+    user = server.storage.get(server.users, str(record.pk))
+
+    updated = server.storage.update(server.users, user)
+
+    scim = UserScim.objects.get()
+    assert user.meta.last_modified is None
+    assert (scim.created, updated.meta.created) == (None, None)
+    assert updated.meta.last_modified == scim.last_modified
+
+
+def test_an_update_changes_the_modification_date_beside_the_user():
+    server = Server(mappings={"User": users_mapping(DATED)})
+    user = create(server, user_name="bjensen")
+
+    updated = server.storage.update(server.users, user)
+
+    assert updated.meta.last_modified > user.meta.last_modified
+    assert updated.meta.created == user.meta.created
+
+
+@pytest.mark.parametrize("sort_order", ["ascending", "descending"])
+def test_a_sort_on_a_date_beside_the_users_orders_as_search_request_sort(sort_order):
+    """Users created outside SCIM have no modification date."""
+    server = Server(mappings={"User": users_mapping(DATED)})
+    for user_name in ["a", "b"]:
+        create(server, user_name=user_name)
+    UserRecord.objects.create(user_name="c", preferred_language="fr")
+    search_request = SearchRequest(sort_by="meta.lastModified", sort_order=sort_order)
+    everyone = sorted(
+        server.storage.search([server.users], SearchRequest()).resources,
+        key=lambda r: r.id,
+    )
+
+    page = server.storage.search([server.users], search_request)
+
+    assert [r.user_name for r in page.resources] == [
+        r.user_name for r in search_request.sort(everyone)
+    ]
+
+
+def test_a_date_beside_the_users_needs_a_date_field():
+    errors = [m.id for m in mapping("scim__level", "meta.created").check()]
+
+    assert errors == ["scim2_django.E006"]
+
+
+def test_dates_split_between_the_user_and_the_record_beside_it():
+    """The creation date stays on the user, and the modification date goes beside it."""
+    server = Server(
+        mappings={"User": users_mapping({"meta.lastModified": "scim__last_modified"})}
+    )
+
+    user = create(server, user_name="bjensen")
+
+    scim = UserScim.objects.get()
+    assert user.meta.created == UserRecord.objects.get().created
+    assert user.meta.last_modified == scim.last_modified
+    assert scim.created is None
+
+
+def test_a_record_holding_a_date_cannot_need_a_value_from_the_client():
+    """Each write creates the card to date it, so its number would be required on every write."""
+    users = users_mapping(
+        {"active": "card__number", "meta.lastModified": "card__issued"}
+    )
+
+    assert [m.id for m in users.check()] == ["scim2_django.E010"]
+
+
+def test_a_record_holding_dates_can_hold_optional_values():
+    """The external identifier and the division need no value, so each write can create the record."""
+    assert users_mapping(BESIDE | DATED).check() == []

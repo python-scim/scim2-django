@@ -144,10 +144,7 @@ def test_a_filter_on_a_related_field_keeps_the_users_kept_in_memory(users, scim_
 def test_a_sort_on_a_related_field_orders_as_search_request_sort(users, sort_order):
     """Users without value come last when ascending and first when descending."""
     search_request = SearchRequest(sort_by="externalId", sort_order=sort_order)
-    everyone = sorted(
-        users.storage.search([users.users], SearchRequest()).resources,
-        key=lambda r: r.id,
-    )
+    everyone = users.storage.search([users.users], SearchRequest()).resources
 
     page = users.storage.search([users.users], search_request)
 
@@ -370,10 +367,7 @@ def test_a_sort_on_a_date_beside_the_users_orders_as_search_request_sort(sort_or
         create(server, user_name=user_name)
     UserRecord.objects.create(user_name="c", preferred_language="fr")
     search_request = SearchRequest(sort_by="meta.lastModified", sort_order=sort_order)
-    everyone = sorted(
-        server.storage.search([server.users], SearchRequest()).resources,
-        key=lambda r: r.id,
-    )
+    everyone = server.storage.search([server.users], SearchRequest()).resources
 
     page = server.storage.search([server.users], search_request)
 

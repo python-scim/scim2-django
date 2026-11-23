@@ -26,6 +26,7 @@ from scim2_server.storage import SearchPage
 
 from .comparison import _Comparator
 from .comparison import _comparator
+from .comparison import _vendor
 from .conversion import _as_stored
 from .conversion import _check_storable
 from .conversion import _comparable
@@ -43,6 +44,9 @@ from .query import _exact_key
 from .query import _root_search
 from .query import _search
 from .query import _with_ids
+
+_DUPLICATE_ENTRY = 1062
+"""The code of MariaDB for a value a unique index already holds."""
 
 
 def _page_rows(
@@ -130,9 +134,24 @@ class DjangoStorage(ScimStorage):
     server as one collection. It pages by index, or with cursors that give
     stable pages (:rfc:`RFC 9865 <9865>`).
 
+    The storage runs on SQLite, PostgreSQL and MariaDB 10.11 or later.
+    Filters and sorts compare strings in the database, whatever the
+    collation of the columns. SQLite compares them with the comparison key of
+    the policy. PostgreSQL and MariaDB approach the default comparison key:
+    they lower the strings unless the attribute is case exact, and order them
+    by code point. PostgreSQL also normalizes them to NFC, which MariaDB
+    cannot do. Other databases compare strings with their own ``lower()`` and
+    collation, with a warning.
+
     On SQLite, set ``"transaction_mode": "IMMEDIATE"`` in the
     :setting:`OPTIONS <DATABASE-OPTIONS>` of the database, so that a write
     waits for another one rather than failing with ``database is locked``.
+    On MariaDB, the unique index of a field follows the collation of its
+    column: a collation ignoring the accents refuses two values that the
+    storage tells apart, so the write raises
+    :class:`~scim2_models.UniquenessException`. With Django 5.2, set
+    ``"charset": "utf8mb4"`` in the :setting:`OPTIONS <DATABASE-OPTIONS>` of
+    the database, so that the strings keep their characters of four bytes.
 
     :param mappings: The mapping of each resource type, by resource type name.
     :param provider: The provider of the server. The storage then returns
@@ -242,7 +261,9 @@ class DjangoStorage(ScimStorage):
             collections = mapping._returned_collections(search_request)
             for start in range(0, len(ids), _LOADED):
                 loaded = mapping._queryset(collections, self.using).filter(
-                    _with_ids(mapping._id, ids[start : start + _LOADED])
+                    _with_ids(
+                        mapping._id, ids[start : start + _LOADED], self._comparator()
+                    )
                 )
                 for record in loaded:
                     record_id = str(getattr(record, mapping._id.key))
@@ -373,7 +394,7 @@ class DjangoStorage(ScimStorage):
 
     def _comparator(self) -> _Comparator:
         """Return how the database compares strings, ready to compare them on the current connection."""
-        vendor = connections[self.using].vendor
+        vendor = _vendor(connections[self.using])
         if vendor not in self._comparators:
             self._comparators[vendor] = _comparator(
                 vendor, self._policy, self.mappings.values()
@@ -432,7 +453,9 @@ class DjangoStorage(ScimStorage):
             records = records.select_for_update()
 
         try:
-            record = records.get(_with_ids(mapping._id, [resource_id]))
+            record = records.get(
+                _with_ids(mapping._id, [resource_id], self._comparator())
+            )
         except mapping.record.DoesNotExist:
             raise self._not_found(resource_type, resource_id) from None
 
@@ -531,7 +554,10 @@ class DjangoStorage(ScimStorage):
         """Save a record and its collections, at the date now. stored is the stored resource, None for a new one.
 
         On an integrity error, the uniqueness is checked again, so that a
-        unique value taken in the meantime raises a 409.
+        unique value taken in the meantime raises a 409. So does a value a
+        unique index of the database refuses, although the storage would
+        accept it, such as a value differing from another by its accents
+        under a collation ignoring them.
         """
         try:
             with transaction.atomic(using=self.using):
@@ -539,8 +565,11 @@ class DjangoStorage(ScimStorage):
                 _write_collections(
                     mapping, resource, record, links, now, creating=stored is None
                 )
-        except IntegrityError:
+        except IntegrityError as error:
             self._check_uniqueness(mapping, resource, stored)
+            if _is_duplicate(error):
+                raise UniquenessException from error
+
             raise
 
     def _check_uniqueness(
@@ -559,7 +588,7 @@ class DjangoStorage(ScimStorage):
         comparator = self._comparator()
         others = mapping.record._default_manager.using(self.using)
         if stored is not None:
-            others = others.exclude(_with_ids(mapping._id, [stored.id]))
+            others = others.exclude(_with_ids(mapping._id, [stored.id], comparator))
 
         for column in mapping._unique_columns():
             value = Path(column.binding.urn).get(resource, strict=False)
@@ -599,7 +628,7 @@ class DjangoStorage(ScimStorage):
         target = collection.target
         assert target is not None
         records = target.record._default_manager.using(self.using).filter(
-            _with_ids(target._id, ids)
+            _with_ids(target._id, ids, self._comparator())
         )
         if target._id.transformed:
             records = records.annotate(**{target._id.key: target._id.expression})
@@ -661,6 +690,17 @@ class DjangoStorage(ScimStorage):
             )
         except ValueError:
             return False
+
+
+def _is_duplicate(error: IntegrityError) -> bool:
+    """Tell whether an integrity error comes from a unique index, by the code the driver of each database gives."""
+    cause: Any = error.__cause__
+    return bool(
+        getattr(cause, "sqlstate", None) == "23505"
+        or getattr(cause, "sqlite_errorname", None)
+        in ("SQLITE_CONSTRAINT_UNIQUE", "SQLITE_CONSTRAINT_PRIMARYKEY")
+        or cause.args[:1] == (_DUPLICATE_ENTRY,)
+    )
 
 
 def _holds_id(collection: _Collection, record: Any, value: str) -> bool:

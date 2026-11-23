@@ -16,10 +16,11 @@ Added
 - :class:`~scim2_django.storage.DjangoStorage` stores the resources in the models of the project.
   A :class:`~scim2_django.storage.ResourceMapping` maps each SCIM attribute to a field, a
   computed expression, the entries of another model, or links to other resources.
-- Filters, sorts and pages run in the database, on SQLite and PostgreSQL. SQLite compares strings
-  with the comparison key of the policy. PostgreSQL compares them in NFC, lowered unless case
-  exact. The storage searches one resource type, or several at the root of the server. It pages
-  by index, or with cursors that give stable pages (:rfc:`RFC 9865 <9865>`).
+- Filters, sorts and pages run in the database, on SQLite, PostgreSQL and MariaDB. SQLite compares
+  strings with the comparison key of the policy. PostgreSQL and MariaDB compare them lowered unless
+  case exact, by code point, and in NFC on PostgreSQL. The storage searches one resource type, or
+  several at the root of the server. It pages by index, or with cursors that give stable pages
+  (:rfc:`RFC 9865 <9865>`).
 - ``manage.py check`` checks the fields of every mapping.
 - An attribute can be stored in a model related by a reverse one-to-one relation, such as a table
   beside the users, with a path such as ``"scim__external_id"``. The storage creates the related

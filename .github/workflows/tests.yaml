@@ -86,6 +86,27 @@ jobs:
       - name: Run tests
         run: uv run pytest --showlocals --database=postgresql
 
+  mariadb:
+    name: MariaDB unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          python-version: "3.14"
+          enable-cache: true
+      - name: Replace the MySQL server of the runner with MariaDB
+        run: |
+          sudo apt-get purge --yes 'mysql-*'
+          sudo apt-get update
+          sudo apt-get install --yes mariadb-server libmariadb-dev
+      - name: Run tests
+        run: uv run --group mariadb pytest --showlocals --database=mariadb
+
   coverage:
     runs-on: ubuntu-24.04
     steps:
@@ -100,10 +121,17 @@ jobs:
           enable-cache: true
       - name: Put the PostgreSQL server of the runner in the PATH
         run: ls -d /usr/lib/postgresql/*/bin | tail -n 1 >> "$GITHUB_PATH"
+      - name: Replace the MySQL server of the runner with MariaDB
+        run: |
+          sudo apt-get purge --yes 'mysql-*'
+          sudo apt-get update
+          sudo apt-get install --yes mariadb-server libmariadb-dev
       - name: Run tests on SQLite
-        run: uv run pytest --cov --cov-report=
+        run: uv run --group mariadb pytest --cov --cov-report=
       - name: Run tests on PostgreSQL
-        run: uv run pytest --cov --cov-append --cov-fail-under=100 --database=postgresql
+        run: uv run --group mariadb pytest --cov --cov-append --cov-report= --database=postgresql
+      - name: Run tests on MariaDB
+        run: uv run --group mariadb pytest --cov --cov-append --cov-fail-under=100 --database=mariadb
 
   minversions:
     name: minimum dependency versions
@@ -159,7 +187,7 @@ jobs:
 
   all-checks:
     if: always()
-    needs: [tests, django, postgresql, coverage, minversions, style, doc]
+    needs: [tests, django, postgresql, mariadb, coverage, minversions, style, doc]
     runs-on: ubuntu-24.04
     steps:
       - name: Fail if a needed job did not succeed

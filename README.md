@@ -12,7 +12,7 @@ your project.
 ## Features
 
 - Storage in the models of your project, with filters, sorts and pages run in the database,
-  on SQLite and PostgreSQL
+  on SQLite, PostgreSQL and MariaDB
 - `manage.py check` checks the mappings between SCIM attributes and model fields
 - Resource endpoints: `POST`, `GET`, `PUT`, `PATCH` and `DELETE`, for every resource type
 - Search: `GET` and `POST /.search`, per resource type and at the server root

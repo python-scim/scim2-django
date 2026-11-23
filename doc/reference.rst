@@ -96,9 +96,10 @@ The checks report the following errors and warnings:
        :class:`~scim2_django.storage.Transformed` cannot be computed on the model.
    * - ``scim2_django.E010``
      - An attribute is mapped to a field of another model, other than through one reverse
-       one-to-one relation of the resource model. Or ``id``, a date or an entry is mapped
-       through a relation. Or the related model has a field without default that the mapping
-       leaves out, so the storage cannot create its records.
+       one-to-one relation of the resource model. Or ``id`` or an entry is mapped through a
+       relation. Or the related model has a field without default that the mapping
+       leaves out, so the storage cannot create its records. Or the related model holds a date,
+       so each write creates its records, and has a mapped field without null nor default.
    * - ``scim2_django.W001``
      - A readable string attribute is mapped to a text field that converts the values it reads,
        such as a field decrypting them. Filters and sorts compare the stored values, not the

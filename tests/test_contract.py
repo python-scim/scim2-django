@@ -76,3 +76,16 @@ class TestDjangoStorageWithTransformedFields(ScimStorageContract):
             "Group": groups_mapping({"id": prefixed("g")}),
         }
         return DjangoStorage(mappings, provider)
+
+
+class TestDjangoStorageWithRelatedDates(ScimStorageContract):
+    """Users whose dates are in a table beside them."""
+
+    @pytest.fixture
+    def storage(self, provider):
+        beside = {
+            "meta.created": "scim__created",
+            "meta.lastModified": "scim__last_modified",
+        }
+        mappings = {"User": users_mapping(beside), "Group": groups_mapping()}
+        return DjangoStorage(mappings, provider)

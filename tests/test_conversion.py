@@ -65,11 +65,9 @@ def save(mapping, resource, record, links=None, creating=True):
     for collection in collections(mapping):
         links.setdefault(collection, [])
 
-    record.created = record.created or NOW
-    record.last_modified = NOW
-    _from_scim(mapping, resource, record, links, creating=creating)
+    _from_scim(mapping, resource, record, links, NOW, creating=creating)
     record.save()
-    _write_collections(mapping, resource, record, links, creating=creating)
+    _write_collections(mapping, resource, record, links, NOW, creating=creating)
     return type(record).objects.get(pk=record.pk)
 
 
@@ -572,7 +570,7 @@ def test_an_empty_string_is_no_value():
     )
     mapping.schemas()
     mentor = UserRecord.objects.create(user_name="m", created=NOW, last_modified=NOW)
-    person = Person(id="p", user_name="a", mentor=mentor, enabled=True)
+    person = Person(id="p", user_name="a", mentor=mentor, enabled=True, created=NOW)
 
     _check_storable(mapping, User(), User(user_name="a"))
     person = save(mapping, User(), person, creating=False)

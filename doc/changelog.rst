@@ -23,7 +23,8 @@ Added
 - ``manage.py check`` checks the fields of every mapping.
 - An attribute can be stored in a model related by a reverse one-to-one relation, such as a table
   beside the users, with a path such as ``"scim__external_id"``. The storage creates the related
-  record at its first value.
+  record at its first value. ``meta.created`` and ``meta.lastModified`` can be stored there too:
+  each write then creates the related record.
 - A :class:`~scim2_django.storage.Transformed` field holds an attribute in another form, such as
   an ``id`` made of a prefix and the primary key, or the hash of a password. Filters and sorts
   compare the value clients read, and a search by ``id`` uses the index of the field.

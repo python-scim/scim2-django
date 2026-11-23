@@ -59,6 +59,8 @@ class UserScim(models.Model):
     external_id = models.TextField(null=True)
     division = models.TextField(blank=True)
     level = models.IntegerField(default=0)
+    created = models.DateTimeField(null=True)
+    last_modified = models.DateTimeField(null=True)
 
 
 class UserCard(models.Model):
@@ -69,6 +71,7 @@ class UserCard(models.Model):
     )
     number = models.IntegerField()
     note = models.TextField(null=True)
+    issued = models.DateTimeField(null=True)
 
 
 class UserBadge(models.Model):

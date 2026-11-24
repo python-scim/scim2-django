@@ -1,6 +1,13 @@
 Changelog
 =========
 
+[Unreleased]
+------------
+
+Changed
+^^^^^^^
+- Needs scim2-server 0.8.8 or later.
+
 [0.1.0] - 2026-11-24
 --------------------
 

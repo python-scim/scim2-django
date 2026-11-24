@@ -1,12 +1,17 @@
 Changelog
 =========
 
-[Unreleased]
-------------
+[0.1.1] - 2026-11-24
+--------------------
 
 Changed
 ^^^^^^^
 - Needs scim2-server 0.8.8 or later.
+
+Fixed
+^^^^^
+- A cursor whose sort value the field reads as an integer beyond a BIGINT raises
+  ``invalidCursor``, instead of an error of the database.
 
 [0.1.0] - 2026-11-24
 --------------------

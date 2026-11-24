@@ -14,6 +14,8 @@ your project.
 - Storage in the models of your project, with filters, sorts and pages run in the database,
   on SQLite, PostgreSQL and MariaDB
 - `manage.py check` checks the mappings between SCIM attributes and model fields
+- The users and the groups of `django.contrib.auth` served without any table, and a model beside
+  them for `externalId`, `meta.lastModified` and the attributes of your project
 - Resource endpoints: `POST`, `GET`, `PUT`, `PATCH` and `DELETE`, for every resource type
 - Search: `GET` and `POST /.search`, per resource type and at the server root
 - Discovery endpoints: `/ServiceProviderConfig`, `/ResourceTypes` and `/Schemas`

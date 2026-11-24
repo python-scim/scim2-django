@@ -1,7 +1,7 @@
 Changelog
 =========
 
-[0.1.0] - Unreleased
+[0.1.0] - 2026-11-24
 --------------------
 
 Added
@@ -16,12 +16,15 @@ Added
 - :class:`~scim2_django.storage.DjangoStorage` stores the resources in the models of the project.
   A :class:`~scim2_django.storage.ResourceMapping` maps each SCIM attribute to a field, a
   computed expression, the entries of another model, or links to other resources.
+  ``manage.py check`` checks the fields of every mapping.
 - Filters, sorts and pages run in the database, on SQLite, PostgreSQL and MariaDB. SQLite compares
   strings with the comparison key of the policy. PostgreSQL and MariaDB compare them lowered unless
   case exact, by code point, and in NFC on PostgreSQL. The storage searches one resource type, or
   several at the root of the server. It pages by index, or with cursors that give stable pages
   (:rfc:`RFC 9865 <9865>`).
-- ``manage.py check`` checks the fields of every mapping.
+- ``meta.created``, ``meta.lastModified`` and the version field are optional in a mapping.
+  Without the dates, the resources have none. Without a version field, ``meta.version`` is a hash
+  of the whole resource, which changes with any change of the resource, its links included.
 - An attribute can be stored in a model related by a reverse one-to-one relation, such as a table
   beside the users, with a path such as ``"scim__external_id"``. The storage creates the related
   record at its first value. ``meta.created`` and ``meta.lastModified`` can be stored there too:
@@ -40,7 +43,3 @@ Added
   groups, for ``externalId``, ``meta.lastModified`` and the attributes of the project. With
   ``scim2_django.auth`` in :setting:`INSTALLED_APPS`, a change outside SCIM changes
   ``meta.lastModified`` too.
-- ``meta.created`` and ``meta.lastModified`` are optional in a mapping. Without them, the
-  resources have no such date.
-- The version field is optional in a mapping. Without it, ``meta.version`` is a hash of the whole
-  resource, which changes with any change of the resource, its links included.

@@ -33,7 +33,7 @@ requires-python = ">=3.11"
 dependencies = [
     "django>=5.2",
     "scim2-models>=0.12.2",
-    "scim2-server>=0.8.0",
+    "scim2-server>=0.8.8",
 ]
 
 [project.urls]
@@ -53,7 +53,7 @@ dev = [
     "pytest-mysql>=5.0.1",
     "pytest-postgresql>=10.0.0",
     "scim2-client>=0.14.1",
-    "scim2-server[cursor]>=0.8.7",
+    "scim2-server[cursor]>=0.8.8",
     "scim2-tester[testing]>=0.6.4",
     "tox-uv>=1.36.0",
 ]

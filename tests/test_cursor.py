@@ -1,5 +1,4 @@
 import datetime
-import decimal
 import uuid
 
 import pytest
@@ -15,8 +14,6 @@ from scim2_django.storage import DjangoStorage
 from scim2_django.storage import ResourceMapping
 from scim2_django.storage import storage as storage_module
 from scim2_django.storage.comparison import _Comparator
-from scim2_django.storage.keyset import _decode
-from scim2_django.storage.keyset import _encode
 
 from .mappings import users_mapping
 from .models import UserRecord
@@ -149,7 +146,7 @@ def test_a_page_reached_forward_assumes_a_previous_page(server):
         {"d": "next", "k": None, "i": 1},
         {"d": "next", "k": {"datetime": "never"}, "i": "x"},
         {"d": "next", "k": None, "i": "not an identifier"},
-        {"d": "next", "k": 10**20, "i": str(uuid.uuid4())},
+        {"d": "next", "k": "alice", "i": str(uuid.uuid4())},
     ],
 )
 def test_a_malformed_position_is_an_invalid_cursor(server, position):
@@ -274,42 +271,6 @@ def test_a_malformed_root_position_is_an_invalid_cursor(mixed, position):
         server.storage.search(resource_types, search_request, position=position)
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        None,
-        True,
-        3,
-        1.5,
-        "text",
-        datetime.datetime(2026, 10, 9, 12, tzinfo=datetime.UTC),
-        datetime.date(2026, 10, 9),
-        decimal.Decimal("1.50"),
-        uuid.UUID(int=1),
-    ],
-)
-def test_a_sort_value_survives_its_position(value):
-    """A sort value is read back from its position in its own type."""
-    assert _decode(_encode(value)) == value
-    assert type(_decode(_encode(value))) is type(value)
-
-
-def test_a_sort_value_of_an_unknown_type_cannot_be_paged():
-    """A sort value JSON cannot hold is refused rather than written wrong."""
-    with pytest.raises(TypeError):
-        _encode(b"bytes")
-
-
-@pytest.mark.parametrize(
-    "value",
-    [["a"], {"a": "1", "b": "2"}, {"bytes": "x"}, {"date": 1}, {"decimal": "x"}],
-)
-def test_a_malformed_sort_value_is_an_invalid_cursor(value):
-    """A sort value that no position holds raises invalidCursor."""
-    with pytest.raises(InvalidCursorException):
-        _decode(value)
-
-
 def ranked_mapping(field):
     """Return a mapping of the users with an integer rank, stored in a field."""
     return ResourceMapping(
@@ -347,6 +308,17 @@ def test_a_sort_value_beyond_its_field_reads_the_values_past_it(ranked):
     page = storage.search([users], search_request, position=position)
 
     assert [r.user_name for r in page.resources] == ["unranked"]
+
+
+@pytest.mark.parametrize("value", [10**20, "100000000000000000000", 1e20, float("inf")])
+def test_an_integer_no_database_stores_is_an_invalid_cursor(ranked, value):
+    """A sort value that the integer field reads as an integer beyond a BIGINT comes from no position this storage gave."""
+    storage, users = ranked
+    position = {"d": "next", "k": value, "i": str(uuid.uuid4())}
+    search_request = SearchRequest(cursor="x", sort_by=f"{RANKED}:rank")
+
+    with pytest.raises(InvalidCursorException):
+        storage.search([users], search_request, position=position)
 
 
 def test_a_sort_value_of_another_type_is_an_invalid_cursor(ranked):

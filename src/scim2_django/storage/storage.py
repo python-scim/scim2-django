@@ -21,6 +21,10 @@ from scim2_models import ScimProvider
 from scim2_models import SearchRequest
 from scim2_models import UniquenessException
 from scim2_models.path import CompareOperator
+from scim2_server.keyset import Bound
+from scim2_server.keyset import Position
+from scim2_server.keyset import keyset_page
+from scim2_server.keyset import page_rows
 from scim2_server.storage import ScimStorage
 from scim2_server.storage import SearchPage
 
@@ -34,9 +38,6 @@ from .conversion import _from_scim
 from .conversion import _link_entries
 from .conversion import _to_scim
 from .conversion import _write_collections
-from .keyset import _Anchor
-from .keyset import _anchor
-from .keyset import _position
 from .mapping import ResourceMapping
 from .mapping import _Collection
 from .query import _compare
@@ -47,26 +48,6 @@ from .query import _with_ids
 
 _DUPLICATE_ENTRY = 1062
 """The code of MariaDB for a value a unique index already holds."""
-
-
-def _page_rows(
-    rows: list[Any], search_request: SearchRequest[Any], anchor: _Anchor | None
-) -> tuple[list[Any], bool]:
-    """Return the rows of a page in the sort order, and whether more rows follow in the reading direction.
-
-    The rows of a cursor page were read count + 1 at a time, in the reverse
-    order for a previous page.
-    """
-    if search_request.cursor is None:
-        return rows, False
-
-    count = search_request.count
-    more = count is not None and len(rows) > count
-    page = rows if count is None else rows[:count]
-    if anchor is not None and not anchor.forward:
-        page.reverse()
-
-    return page, more
 
 
 _LOADED = 500
@@ -82,32 +63,15 @@ def _by_position(rows: list[dict[str, Any]]) -> dict[int, list[str]]:
     return ids
 
 
-def _cursor_page(
-    total: int,
-    resources: list[Resource[Any]],
-    bounds: list[tuple[Any, tuple[Any, ...]]],
-    more: bool,
-    anchor: _Anchor | None,
-) -> SearchPage:
-    """Return a cursor page with the positions of the pages around it.
+def _record_bound(mapping: ResourceMapping, record: Any) -> Bound:
+    """Return the sort value and the identifier of a record of a page."""
+    key = getattr(record, "scim_sort_key", None)
+    return Bound(key, str(getattr(record, mapping._id.key)))
 
-    bounds holds the sort value and the ties of the first and the last rows
-    of the page. A page is known to follow in the reading direction only. In
-    the other direction, the page the client comes from is assumed to still
-    exist.
-    """
-    page = SearchPage(total, resources)
-    if not bounds:
-        return page
 
-    forward = anchor is None or anchor.forward
-    if more or not forward:
-        page.next = _position("next", *bounds[-1])
-
-    if anchor is not None and (more or forward):
-        page.previous = _position("previous", *bounds[0])
-
-    return page
+def _row_bound(row: dict[str, Any]) -> Bound:
+    """Return the sort value, the identifier and the resource type position of a row of a page at the root."""
+    return Bound(row.get("scim_sort_key"), row["scim_id"], row["scim_position"])
 
 
 def _now() -> Any:
@@ -218,11 +182,11 @@ class DjangoStorage(ScimStorage):
 
         (resource_type,) = resource_types
         mapping = self._mapping(resource_type)
-        anchor = _anchor(position, root=False)
+        anchor = Position.load(position, has_sort=search_request.sort_by is not None)
         matching, records = _search(
             mapping, search_request, self._comparator(), self.using, anchor
         )
-        page, more = _page_rows(list(records), search_request, anchor)
+        page, more = page_rows(list(records), search_request, anchor)
         resources = [
             self._to_scim(resource_type, record, search_request) for record in page
         ]
@@ -230,14 +194,9 @@ class DjangoStorage(ScimStorage):
         if search_request.cursor is None:
             return SearchPage(total, resources)
 
-        bounds = [
-            (
-                getattr(record, "scim_sort_key", None),
-                (str(getattr(record, mapping._id.key)),),
-            )
-            for record in page[:1] + page[-1:]
-        ]
-        return _cursor_page(total, resources, bounds, more, anchor)
+        first = _record_bound(mapping, page[0]) if page else None
+        last = _record_bound(mapping, page[-1]) if page else None
+        return keyset_page(total, resources, first, last, more, anchor)
 
     def _root_search(
         self,
@@ -250,11 +209,15 @@ class DjangoStorage(ScimStorage):
         A record deleted after the page was selected is left out.
         """
         mappings = [self._mapping(resource_type) for resource_type in resource_types]
-        anchor = _anchor(position, root=True)
+        anchor = Position.load(
+            position,
+            has_sort=search_request.sort_by is not None,
+            type_count=len(mappings),
+        )
         total, rows = _root_search(
             mappings, search_request, self._comparator(), self.using, anchor
         )
-        rows, more = _page_rows(rows, search_request, anchor)
+        rows, more = page_rows(rows, search_request, anchor)
         records: dict[tuple[int, str], Any] = {}
         for type_position, ids in _by_position(rows).items():
             mapping = mappings[type_position]
@@ -283,11 +246,9 @@ class DjangoStorage(ScimStorage):
         if search_request.cursor is None:
             return SearchPage(total, resources)
 
-        bounds = [
-            (row.get("scim_sort_key"), (row["scim_position"], row["scim_id"]))
-            for row in rows[:1] + rows[-1:]
-        ]
-        return _cursor_page(total, resources, bounds, more, anchor)
+        first = _row_bound(rows[0]) if rows else None
+        last = _row_bound(rows[-1]) if rows else None
+        return keyset_page(total, resources, first, last, more, anchor)
 
     def create(
         self, resource_type: ResourceType, resource: Resource[Any]

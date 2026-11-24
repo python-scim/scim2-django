@@ -4,6 +4,7 @@ from collections.abc import Callable
 from collections.abc import Iterable
 from functools import reduce
 from typing import Any
+from typing import cast
 
 from django.core.exceptions import ValidationError
 from django.db import DEFAULT_DB_ALIAS
@@ -38,11 +39,11 @@ from scim2_models.path import Not
 from scim2_models.path import Present
 from scim2_models.path import ValuePath
 from scim2_models.path import coerce_value
+from scim2_server.keyset import Position
 
 from .comparison import _SUBSTRINGS
 from .comparison import _Comparator
 from .conversion import _as_stored
-from .keyset import _Anchor
 from .keyset import _beyond
 from .keyset import _keyset_order
 from .mapping import ResourceMapping
@@ -81,6 +82,9 @@ _NUMBERS = {
     "SmallIntegerField",
 }
 """The internal types of the fields holding numbers."""
+
+_INTEGERS = range(-(2**63), 2**63)
+"""The integers a database can store, in a BIGINT or in an SQLite INTEGER."""
 
 _TRUE = Q(Value(True, output_field=BooleanField()))
 _FALSE = Q(Value(False, output_field=BooleanField()))
@@ -514,7 +518,7 @@ def _search(
     search_request: SearchRequest[Any],
     comparator: _Comparator,
     using: str = DEFAULT_DB_ALIAS,
-    anchor: _Anchor | None = None,
+    anchor: Position | None = None,
 ) -> tuple["models.QuerySet[Any]", "models.QuerySet[Any]"]:
     """Return the matching records, and the page of them a search asks for.
 
@@ -553,7 +557,7 @@ def _search(
         if key is not None:
             anchor = _sort_anchor(page, anchor)
 
-        value = _as_key(mapping._id, anchor.ties[0])
+        value = _as_key(mapping._id, anchor.id)
         if value is None:
             raise InvalidCursorException
 
@@ -576,7 +580,7 @@ def _tie(column: _Column, comparator: _Comparator) -> Any:
     return comparator.exact(field)
 
 
-def _sort_anchor(page: "models.QuerySet[Any]", anchor: _Anchor) -> _Anchor:
+def _sort_anchor(page: "models.QuerySet[Any]", anchor: Position) -> Position:
     """Return an anchor whose sort value has the type of the sort key of a page.
 
     A sort value the key cannot hold, such as a text on an integer field
@@ -586,15 +590,21 @@ def _sort_anchor(page: "models.QuerySet[Any]", anchor: _Anchor) -> _Anchor:
     return _typed_anchor(output, anchor)
 
 
-def _typed_anchor(output: Any, anchor: _Anchor) -> _Anchor:
-    """Return an anchor whose sort value has the type of a field, refusing a value the field cannot hold."""
+def _typed_anchor(output: Any, anchor: Position) -> Position:
+    """Return an anchor whose sort value has the type of a field, refusing a value the field cannot hold.
+
+    An integer no database stores is refused too.
+    """
     if anchor.key is None:
         return anchor
 
     try:
         key = output.to_python(anchor.key)
-    except (ValidationError, TypeError, ValueError):
+    except (ValidationError, TypeError, ValueError, OverflowError):
         raise InvalidCursorException from None
+
+    if isinstance(key, int) and not isinstance(key, bool) and key not in _INTEGERS:
+        raise InvalidCursorException
 
     return dataclasses.replace(anchor, key=key)
 
@@ -604,7 +614,7 @@ def _root_search(
     search_request: SearchRequest[Any],
     comparator: _Comparator,
     using: str = DEFAULT_DB_ALIAS,
-    anchor: _Anchor | None = None,
+    anchor: Position | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Return the number of matching records of several mappings, and the rows of the page a search asks for.
 
@@ -631,7 +641,7 @@ def _root_search(
 
     output = next(iter(outputs.values()), None)
     if anchor is not None:
-        anchor = _root_anchor(outputs, len(mappings), anchor)
+        anchor = _root_anchor(outputs, anchor)
 
     matching = []
     rows = []
@@ -689,23 +699,18 @@ def _family(field: Any) -> str:
     return "number" if internal_type in _NUMBERS else internal_type
 
 
-def _root_anchor(outputs: dict[int, Any], count: int, anchor: _Anchor) -> _Anchor:
+def _root_anchor(outputs: dict[int, Any], anchor: Position) -> Position:
     """Return an anchor of a search at the root, with a sort value of the type of the field of its row.
 
-    The anchor needs the position of a searched resource type, and a sort
-    value only when that type has a sort key.
+    The anchor has a sort value only when its resource type has a sort key.
     """
-    position = anchor.ties[0]
-    if position not in range(count):
-        raise InvalidCursorException
-
     if anchor.key is None:
         return anchor
 
-    if position not in outputs:
+    if anchor.type_index not in outputs:
         raise InvalidCursorException
 
-    return _typed_anchor(outputs[position], anchor)
+    return _typed_anchor(outputs[anchor.type_index], anchor)
 
 
 def _output_field(mapping: ResourceMapping, key: Any) -> Any:
@@ -715,21 +720,21 @@ def _output_field(mapping: ResourceMapping, key: Any) -> Any:
 
 
 def _root_beyond(
-    position: int, output: Any, anchor: _Anchor, search_request: SearchRequest[Any]
+    position: int, output: Any, anchor: Position, search_request: SearchRequest[Any]
 ) -> Q:
     """Return the condition keeping the rows of the mapping at a position past the anchor, in the reading direction.
 
     Rows of an earlier resource type come before the anchor. Rows of a later
     resource type come after it.
     """
-    anchor_position, anchor_id = anchor.ties
+    anchor_position = cast(int, anchor.type_index)
     after = position > anchor_position if anchor.forward else position < anchor_position
     if position != anchor_position:
         tie_after = _TRUE if after else _FALSE
     elif anchor.forward:
-        tie_after = Q(GreaterThan(models.F("scim_id"), anchor_id))
+        tie_after = Q(GreaterThan(models.F("scim_id"), anchor.id))
     else:
-        tie_after = Q(LessThan(models.F("scim_id"), anchor_id))
+        tie_after = Q(LessThan(models.F("scim_id"), anchor.id))
 
     key = None if output is None else models.F("scim_sort_key")
     descending = search_request.sort_order == SearchRequest.SortOrder.descending

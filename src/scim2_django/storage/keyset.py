@@ -1,9 +1,4 @@
-import datetime
-import decimal
-import uuid
-from collections.abc import Callable
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Any
 
 from django.db.models import Q
@@ -11,104 +6,7 @@ from django.db.models.lookups import Exact
 from django.db.models.lookups import GreaterThan
 from django.db.models.lookups import IsNull
 from django.db.models.lookups import LessThan
-from scim2_models import InvalidCursorException
-
-_TAGGED: dict[str, tuple[type, Callable[[Any], str], Callable[[str], Any]]] = {
-    "datetime": (
-        datetime.datetime,
-        datetime.datetime.isoformat,
-        datetime.datetime.fromisoformat,
-    ),
-    "date": (datetime.date, datetime.date.isoformat, datetime.date.fromisoformat),
-    "decimal": (decimal.Decimal, str, decimal.Decimal),
-    "uuid": (uuid.UUID, str, uuid.UUID),
-}
-
-_INTEGERS = range(-(2**63), 2**63)
-"""The integers a database can store, in a BIGINT or in an SQLite INTEGER."""
-
-
-def _encode(value: Any) -> Any:
-    """Return a sort value as a value JSON can hold, tagged with its type when JSON has none."""
-    if value is None or isinstance(value, bool | int | float | str):
-        return value
-
-    for tag, (python_type, dump, _) in _TAGGED.items():
-        if isinstance(value, python_type):
-            return {tag: dump(value)}
-
-    raise TypeError(f"Cannot page on a sort value of type {type(value).__name__}")
-
-
-def _decode(value: Any) -> Any:
-    """Return the sort value a position holds."""
-    if value is None or isinstance(value, bool | int | float | str):
-        return value
-
-    if not isinstance(value, dict) or len(value) != 1:
-        raise InvalidCursorException
-
-    ((tag, text),) = value.items()
-    if tag not in _TAGGED or not isinstance(text, str):
-        raise InvalidCursorException
-
-    try:
-        return _TAGGED[tag][2](text)
-    except (ValueError, decimal.InvalidOperation):
-        raise InvalidCursorException from None
-
-
-@dataclass(frozen=True)
-class _Anchor:
-    """The row a cursor page starts after, or ends before.
-
-    ties are the values that order the rows sharing a sort value: the
-    identifier as text, preceded at the root by the position of the resource
-    type.
-    """
-
-    forward: bool
-    key: Any
-    ties: tuple[Any, ...]
-
-
-def _anchor(position: Any, root: bool) -> _Anchor | None:
-    """Read the position a storage gave, or return None for the first page."""
-    if position is None:
-        return None
-
-    names = {"d", "k", "t", "i"} if root else {"d", "k", "i"}
-    if not isinstance(position, dict) or set(position) != names:
-        raise InvalidCursorException
-
-    if position["d"] not in ("next", "previous") or not isinstance(position["i"], str):
-        raise InvalidCursorException
-
-    ties: tuple[Any, ...] = (position["i"],)
-    if root:
-        if type(position["t"]) is not int:
-            raise InvalidCursorException
-
-        ties = (position["t"], position["i"])
-
-    key = _decode(position["k"])
-    if isinstance(key, int) and not isinstance(key, bool) and key not in _INTEGERS:
-        raise InvalidCursorException
-
-    return _Anchor(position["d"] == "next", key, ties)
-
-
-def _position(direction: str, key: Any, ties: Sequence[Any]) -> Any:
-    """Return the position of the page before or after a row, as a value JSON can hold.
-
-    The sort value is null when the search has no sort.
-    """
-    position: dict[str, Any] = {"d": direction, "k": _encode(key)}
-    if len(ties) == 2:
-        position["t"] = ties[0]
-
-    position["i"] = ties[-1]
-    return position
+from scim2_server.keyset import Position
 
 
 def _key_order(key: Any, ascending: bool) -> Any:
@@ -130,7 +28,7 @@ def _keyset_order(
     return [*terms, *(tie.asc() if forward else tie.desc() for tie in ties)]
 
 
-def _beyond(key: Any, tie_after: Q, anchor: _Anchor, descending: bool) -> Q:
+def _beyond(key: Any, tie_after: Q, anchor: Position, descending: bool) -> Q:
     """Return the condition keeping the rows past the anchor, in the reading direction.
 
     tie_after keeps the rows whose ties come after the ones of the anchor.

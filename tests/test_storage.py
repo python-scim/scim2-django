@@ -3,6 +3,7 @@ import datetime
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError
+from django.db import connection
 from django.db.models import F
 from scim2_models import Group
 from scim2_models import InvalidValueException
@@ -13,14 +14,18 @@ from scim2_models import ScimPolicy
 from scim2_models import ScimProvider
 from scim2_models import SearchRequest
 from scim2_models import UniquenessException
+from scim2_models import User
 from scim2_server.utils import load_default_provider
 from scim2_server.utils import load_default_service_provider_config
 
 from scim2_django.storage import DjangoStorage
+from scim2_django.storage import ResourceMapping
+from scim2_django.storage.comparison import _vendor
 
 from .mappings import groups_mapping
 from .mappings import users_mapping
 from .models import EmailRecord
+from .models import Person
 from .models import UserRecord
 
 pytestmark = pytest.mark.django_db
@@ -140,17 +145,13 @@ def test_a_unique_value_taken_in_the_meantime_is_refused():
     assert UserRecord.objects.count() == 1
 
 
-class Blind(DjangoStorage):
-    """A storage that never checks uniqueness."""
+def test_another_integrity_error_goes_up(server, monkeypatch):
+    """An error that neither the uniqueness nor a unique index explains is not hidden."""
 
-    def _check_uniqueness(self, mapping, resource, stored):
-        pass
+    def refuse(*args, **kwargs):
+        raise IntegrityError("CHECK constraint failed") from ValueError("check")
 
-
-def test_another_integrity_error_goes_up():
-    """An error the uniqueness does not explain is not hidden."""
-    server = Server(Blind)
-    server.create_user("bjensen")
+    monkeypatch.setattr(UserRecord, "save", refuse)
 
     with pytest.raises(IntegrityError):
         server.create_user("bjensen")
@@ -180,7 +181,7 @@ def test_a_member_of_another_type_is_refused(server):
         server.create_group([{"value": user.id, "type": "Group"}])
 
 
-@pytest.mark.filterwarnings("ignore:The postgresql storage cannot compare")
+@pytest.mark.filterwarnings("ignore:The .* storage cannot compare")
 def test_a_type_the_policy_cannot_compare_is_refused():
     server = Server(policy=ScimPolicy(comparison_key=strict_key))
     user = server.create_user("bjensen")
@@ -202,6 +203,9 @@ def test_a_group_resource_type_without_provider():
 
 def test_a_unique_value_written_by_another_application_can_stay(server):
     """A user whose name differs from another one by its case only can still be changed."""
+    if _vendor(connection) == "mariadb":
+        pytest.skip("The unique index of MariaDB ignores the case, as the column does")
+
     server.create_user("alice")
     record = UserRecord.objects.create(
         user_name="Alice", created=NOW, last_modified=NOW
@@ -286,3 +290,72 @@ def test_a_resource_is_found_by_the_exact_text_of_its_identifier(server, text):
 
     with pytest.raises(InvalidValueException):
         server.create_group([{"value": value, "type": "Group"}])
+
+
+def test_a_value_a_unique_index_refuses_is_not_unique():
+    """The serial number is unique in the database, although SCIM lets two users share an externalId."""
+    server = Server(mappings={"User": users_mapping({"externalId": "serial"})})
+    server.storage.create(
+        server.users, server.user_model(user_name="a", external_id="1")
+    )
+
+    with pytest.raises(UniquenessException):
+        server.storage.create(
+            server.users, server.user_model(user_name="b", external_id="1")
+        )
+
+
+def test_a_value_the_collation_of_a_unique_column_ignores_is_not_unique(server):
+    """The default collation of MariaDB ignores the accents, so its unique index refuses José next to Jose."""
+    if _vendor(connection) != "mariadb":
+        pytest.skip("Only MariaDB ignores the accents in the unique index")
+
+    server.create_user("Jose")
+
+    with pytest.raises(UniquenessException):
+        server.create_user("José")
+
+
+@pytest.fixture
+def people():
+    """Return a server of people, whose identifiers are text: abc, b and C."""
+    mentor = UserRecord.objects.create(user_name="m", preferred_language="fr")
+    for pk in ["abc", "b", "C"]:
+        Person.objects.create(
+            id=pk,
+            user_name=pk,
+            enabled=True,
+            mentor=mentor,
+            created=NOW,
+            last_modified=NOW,
+        )
+
+    people = ResourceMapping(
+        User,
+        Person,
+        {"id": "id", "userName": "user_name", "meta.created": "created"},
+        version="version",
+    )
+    return Server(mappings={"User": people, "Group": groups_mapping({"members": None})})
+
+
+@pytest.mark.parametrize("text", ["ABC", "abc "])
+def test_a_text_identifier_is_found_by_its_exact_text(people, text):
+    """A collation ignoring the case, or the trailing spaces, does not find another identifier."""
+    assert people.storage.get(people.users, "abc").id == "abc"
+    with pytest.raises(NotFoundException):
+        people.storage.get(people.users, text)
+
+
+def test_cursors_page_once_through_text_identifiers(people):
+    """The identifiers order the people a sort leaves tied, as the anchors of the cursors compare them."""
+    search_request = SearchRequest(cursor="", count=1, sort_by="meta.created")
+    pages = [people.storage.search([people.users], search_request)]
+    while pages[-1].next is not None and len(pages) < 5:
+        pages.append(
+            people.storage.search(
+                [people.users], search_request, position=pages[-1].next
+            )
+        )
+
+    assert sorted(r.id for page in pages for r in page.resources) == ["C", "abc", "b"]

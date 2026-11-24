@@ -165,10 +165,7 @@ def test_a_selection_on_an_unmapped_sub_attribute_is_refused(users):
 @pytest.mark.parametrize("sort_order", ["ascending", "descending"])
 def test_a_sort_on_the_entry_orders_as_search_request_sort(users, sort_order):
     search_request = SearchRequest(sort_by="emails", sort_order=sort_order)
-    everyone = sorted(
-        users.storage.search([users.users], SearchRequest()).resources,
-        key=lambda r: r.id,
-    )
+    everyone = users.storage.search([users.users], SearchRequest()).resources
 
     page = users.storage.search([users.users], search_request)
 

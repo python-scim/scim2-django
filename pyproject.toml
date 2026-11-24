@@ -50,11 +50,15 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "pytest-django>=4.14.0",
+    "pytest-mysql>=5.0.1",
     "pytest-postgresql>=10.0.0",
     "scim2-client>=0.14.1",
     "scim2-server[cursor]>=0.8.7",
     "scim2-tester[testing]>=0.6.4",
     "tox-uv>=1.36.0",
+]
+mariadb = [
+    "mysqlclient>=2.3.0",
 ]
 doc = [
     "shibuya>=2026.7.12",
@@ -134,6 +138,7 @@ env_list = [
     "django61",
     "minversions",
     "postgresql",
+    "mariadb",
     "doc",
     "coverage",
 ]
@@ -173,6 +178,12 @@ commands = [
     ["pytest", "--showlocals", "--full-trace", "--database=postgresql", "{posargs}"],
 ]
 
+[tool.tox.env.mariadb]
+dependency_groups = ["dev", "mariadb"]
+commands = [
+    ["pytest", "--showlocals", "--full-trace", "--database=mariadb", "{posargs}"],
+]
+
 [tool.tox.env.doc]
 dependency_groups = ["doc"]
 commands = [
@@ -180,8 +191,10 @@ commands = [
 ]
 
 [tool.tox.env.coverage]
+dependency_groups = ["dev", "mariadb"]
 commands = [
     ["pytest", "--cov", "--cov-report=", "{posargs}"],
-    ["pytest", "--cov", "--cov-append", "--cov-fail-under=100", "--cov-report", "term:skip-covered", "--database=postgresql", "{posargs}"],
+    ["pytest", "--cov", "--cov-append", "--cov-report=", "--database=postgresql", "{posargs}"],
+    ["pytest", "--cov", "--cov-append", "--cov-fail-under=100", "--cov-report", "term:skip-covered", "--database=mariadb", "{posargs}"],
     ["coverage", "html"],
 ]

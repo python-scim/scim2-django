@@ -114,13 +114,16 @@ def _exact_key(column: _Column, value: str) -> Any:
     return None
 
 
-def _with_ids(column: _Column, values: Iterable[str | None]) -> Q:
+def _with_ids(
+    column: _Column, values: Iterable[str | None], comparator: _Comparator
+) -> Q:
     """Return the condition keeping the records whose identifier is one of values.
 
     The field is compared, so that the database uses its index. An identifier
     is found by its exact text only: "01" does not find the identifier "1".
-    The expression of a transformed identifier is compared too, so that
-    "u012" does not find the identifier "u12".
+    The text an identifier is read as is compared too, code point by code
+    point, so that "u012" does not find the identifier "u12", and "ABC" does
+    not find "abc" under a collation ignoring the case.
     """
     texts = [value for value in values if value is not None]
     keys = [
@@ -128,7 +131,9 @@ def _with_ids(column: _Column, values: Iterable[str | None]) -> Q:
     ]
     condition = Q(**{f"{column.field_key}__in": keys})
     if column.transformed:
-        condition &= Q(In(column.compared, texts))
+        condition &= Q(In(comparator.exact(column.compared), texts))
+    elif not column.textual:
+        condition &= Q(In(comparator.exact(models.F(column.field_key)), texts))
 
     return condition
 
@@ -373,7 +378,7 @@ def _compare(
         return _FALSE
 
     if column.keyed and op in (CompareOperator.eq, CompareOperator.ne):
-        return _compare_key(column, op, value)
+        return _compare_key(column, op, value, comparator)
 
     if not column.is_string:
         if op == CompareOperator.ne:
@@ -401,7 +406,9 @@ def _compare(
     return _is_not_null(left) & condition
 
 
-def _compare_key(column: _Column, op: CompareOperator, value: str) -> Q:
+def _compare_key(
+    column: _Column, op: CompareOperator, value: str, comparator: _Comparator
+) -> Q:
     """Compare an identifier in its own type.
 
     The database then uses its index, and the result does not depend on how
@@ -414,7 +421,7 @@ def _compare_key(column: _Column, op: CompareOperator, value: str) -> Q:
     field = models.F(column.field_key)
     condition = Q(**{f"{column.field_key}__exact": key})
     if column.transformed:
-        condition &= Q(Exact(column.compared, value))
+        condition &= Q(Exact(comparator.exact(column.compared), value))
 
     if op == CompareOperator.ne:
         return _is_null(field) | ~condition
@@ -531,7 +538,7 @@ def _search(
         page = page.annotate(scim_sort_key=key)
         key = models.F("scim_sort_key")
 
-    tie = models.F(mapping._id.field_key)
+    tie = _tie(mapping._id, comparator)
     descending = search_request.sort_order == SearchRequest.SortOrder.descending
     forward = anchor is None or anchor.forward
     page = page.order_by(*_keyset_order(key, [tie], descending, forward))
@@ -550,14 +557,23 @@ def _search(
         if value is None:
             raise InvalidCursorException
 
-        lookup = "gt" if anchor.forward else "lt"
-        tie_after = Q(**{f"{mapping._id.field_key}__{lookup}": value})
+        after = GreaterThan if anchor.forward else LessThan
+        tie_after = Q(after(tie, value))
         page = page.filter(_beyond(key, tie_after, anchor, descending))
 
     if search_request.count is None:
         return matching, page
 
     return matching, page[: search_request.count + 1]
+
+
+def _tie(column: _Column, comparator: _Comparator) -> Any:
+    """Return the expression ordering the records a sort leaves tied: their identifier field, compared code point by code point when it holds text."""
+    field = models.F(column.field_key)
+    if column.textual or column.transformed:
+        return field
+
+    return comparator.exact(field)
 
 
 def _sort_anchor(page: "models.QuerySet[Any]", anchor: _Anchor) -> _Anchor:
@@ -633,7 +649,8 @@ def _root_search(
         records = records.annotate(
             scim_position=Value(position, output_field=IntegerField()),
             scim_id=ExpressionWrapper(
-                mapping._id.compared, output_field=models.TextField()
+                comparator.exact(mapping._id.compared),
+                output_field=models.TextField(),
             ),
         )
         names = ["scim_position", "scim_id"]

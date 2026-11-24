@@ -594,8 +594,8 @@ class ResourceMapping:
         reads every collection of a resource, even those a response leaves
         out, such as the members of a group: prefer a version field for large
         groups. The hash protects the writes on databases that read committed
-        data, as PostgreSQL and SQLite do. Under the repeatable reads of
-        MySQL, use a version field.
+        data, as Django sets up PostgreSQL and MariaDB, and as SQLite does.
+        Under repeatable reads, use a version field.
     :raises ValueError: When a path is not valid for the model, or when a
         value does not fit the attribute of its path.
     """

@@ -1,5 +1,6 @@
 import datetime
 import warnings
+from types import SimpleNamespace
 
 import pytest
 from django.db import connection
@@ -21,6 +22,7 @@ from scim2_server.testing import SEARCH_USERS
 from scim2_django.storage import Computed
 from scim2_django.storage import Many
 from scim2_django.storage.comparison import _comparator
+from scim2_django.storage.comparison import _vendor
 from scim2_django.storage.conversion import _to_scim
 from scim2_django.storage.query import _search
 
@@ -109,7 +111,7 @@ class Search:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             self.comparator = _comparator(
-                vendor or connection.vendor, ScimPolicy(), [self.users, self.groups]
+                vendor or _vendor(connection), ScimPolicy(), [self.users, self.groups]
             )
 
         self.comparator.prepare("default")
@@ -215,12 +217,13 @@ def test_sqlite_compares_with_the_key_of_the_policy():
 
 
 def test_a_decomposed_value_matches_its_composed_form():
-    """Both sides are compared in NFC, whatever form the value was written in."""
+    """Both sides are compared in NFC, whatever form the value was written in, except on MariaDB, which cannot normalize a string."""
     search = Search()
     search.store(search.users, UserRecord(), {"userName": "Jose\u0301"})
+    expected = 0 if _vendor(connection) == "mariadb" else 1
 
-    assert search.search(UserRecord, filter='userName eq "JOSÉ"')[0] == 1
-    assert search.search(UserRecord, filter='userName ew "sé"')[0] == 1
+    assert search.search(UserRecord, filter='userName eq "JOSÉ"')[0] == expected
+    assert search.search(UserRecord, filter='userName ew "sé"')[0] == expected
 
 
 @pytest.mark.parametrize(
@@ -264,7 +267,7 @@ def test_a_comparator_finds_the_links_bound_after_it():
     users, groups = users_mapping(), groups_mapping()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        comparator = _comparator(connection.vendor, ScimPolicy(), [users, groups])
+        comparator = _comparator(_vendor(connection), ScimPolicy(), [users, groups])
 
     search = Search(users)
     search.comparator = comparator
@@ -337,7 +340,8 @@ def test_a_simple_multi_valued_attribute_is_filtered_and_sorted_on_its_values():
     search = Search(vendor="other")
     search.users = tagged
     resources = [
-        to_scim(tagged, record) for record in tagged._queryset(collections(tagged))
+        to_scim(tagged, record)
+        for record in tagged._queryset(collections(tagged)).order_by("pk")
     ]
 
     for scim_filter in (
@@ -352,8 +356,7 @@ def test_a_simple_multi_valued_attribute_is_filtered_and_sorted_on_its_values():
 
     search_request = SearchRequest(sort_by=f"{TAGGED}:tags")
     _, ids = search.search(UserRecord, sort_by=f"{TAGGED}:tags")
-    by_id = sorted(resources, key=lambda r: r.id)
-    assert ids == [r.id for r in search_request.sort(by_id)]
+    assert ids == [r.id for r in search_request.sort(resources)]
 
 
 def test_every_readable_collection_is_returned_without_parameters():
@@ -426,9 +429,9 @@ def test_a_filter_on_an_attribute_filters_cannot_read_is_refused(stored, scim_fi
     [*SEARCH_SORTS, "locale", "id", "nonexistent", "password", "preferredLanguage"],
 )
 def test_a_sort_orders_the_users_as_search_request_sort(stored, sort_by, sort_order):
-    """The database orders the users as SearchRequest.sort does, ties by identifier."""
+    """The database orders the users as SearchRequest.sort does, ties in the order of their identifiers in the database."""
     search_request = SearchRequest(sort_by=sort_by, sort_order=sort_order)
-    resources = sorted(stored.resources(UserRecord), key=lambda r: r.id)
+    resources = stored.resources(UserRecord)
 
     _, ids = stored.search(UserRecord, sort_by=sort_by, sort_order=sort_order)
 
@@ -476,3 +479,39 @@ def test_a_search_loads_the_collections_the_response_keeps(
 
     assert sorted(len(r.emails or []) for r in resources) == [0, 1, 1, 2]
     assert all(r.groups is None for r in resources)
+
+
+@pytest.mark.parametrize(
+    ("database", "expected"),
+    [
+        (
+            SimpleNamespace(
+                vendor="mysql", mysql_is_mariadb=True, mysql_version=(10, 11, 6)
+            ),
+            "mariadb",
+        ),
+        (
+            SimpleNamespace(
+                vendor="mysql", mysql_is_mariadb=True, mysql_version=(10, 6, 21)
+            ),
+            "mysql",
+        ),
+        (
+            SimpleNamespace(
+                vendor="mysql", mysql_is_mariadb=False, mysql_version=(8, 4, 0)
+            ),
+            "mysql",
+        ),
+        (SimpleNamespace(vendor="mysql"), "mysql"),
+        (SimpleNamespace(vendor="sqlite"), "sqlite"),
+    ],
+    ids=["mariadb", "mariadb without uca1400", "mysql", "another backend", "sqlite"],
+)
+def test_mariadb_is_told_apart_from_mysql(database, expected):
+    """Django names both databases mysql. Strings are compared as on MariaDB from MariaDB 10.10 only."""
+    assert _vendor(database) == expected
+
+
+def test_mariadb_warns_it_cannot_follow_the_key_of_the_policy():
+    with pytest.warns(UserWarning, match="mariadb storage cannot compare"):
+        _comparator("mariadb", ScimPolicy(comparison_key=strict_key), [])

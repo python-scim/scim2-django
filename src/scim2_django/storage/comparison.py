@@ -1,6 +1,7 @@
 import itertools
 import unicodedata
 import warnings
+from collections.abc import Callable
 from collections.abc import Iterable
 from typing import Any
 
@@ -50,6 +51,14 @@ class _Comparator:
     def prepare(self, using: str) -> None:
         """Make a database connection ready to compare strings."""
 
+    def exact(self, expression: Any) -> Any:
+        """Return a string expression compared code point by code point, as identifiers are.
+
+        The databases compare strings so by default, unless the collation
+        of their columns ignores the case.
+        """
+        return expression
+
     def column(self, column: _Column) -> Any:
         """Return a string column in the form it is compared under."""
         if column.casefolded:
@@ -72,30 +81,74 @@ class _Comparator:
         return Q(_SUBSTRINGS[op](self.column(column), self.operand(column, value)))
 
 
-class _Normalizer(_Comparator):
-    """Compare strings in PostgreSQL, normalized to NFC on both sides.
+class _Collator(_Comparator):
+    """Compare strings in the same form on both sides, ordered by code point as scim2-models orders them.
+
+    form builds that form from a string expression. The value is normalized
+    to NFC in Python, as the stored strings usually are.
+    """
+
+    def __init__(
+        self,
+        policy: ScimPolicy,
+        form: Callable[[_Column, Any], Any],
+        exact: Callable[[Any], Any],
+    ) -> None:
+        super().__init__(policy)
+        self.form = form
+        self._exact = exact
+
+    def exact(self, expression: Any) -> Any:
+        """Return a string expression compared code point by code point, whatever the collation of its column."""
+        return self._exact(expression)
+
+    def column(self, column: _Column) -> Any:
+        """Return a string column in the form it is compared under."""
+        return self.form(column, column.compared)
+
+    def operand(self, column: _Column, value: str) -> Any:
+        """Return a string normalized to NFC, in the form it is compared under."""
+        normalized = unicodedata.normalize("NFC", value)
+        return self.form(column, Value(normalized, output_field=TextField()))
+
+
+def _postgresql_form(column: _Column, expression: Any) -> Any:
+    """Return a string expression of PostgreSQL normalized to NFC, lowered if the column ignores the case, under the C collation.
 
     The lower() of PostgreSQL follows the locale of the database, so the
     comparison approaches the default comparison key without reaching it. The
-    C collation orders the strings by code point, as scim2-models does.
+    C collation orders the strings by code point.
     """
+    normalized = _normalize(expression)
+    if column.casefolded:
+        normalized = _normalize(Lower(normalized))
 
-    def _form(self, column: _Column, expression: Any) -> Any:
-        """Normalize a string expression to NFC, lowered if the column ignores the case, under the C collation."""
-        normalized = _normalize(expression)
-        if column.casefolded:
-            normalized = _normalize(Lower(normalized))
+    return Collate(normalized, "C")
 
-        return Collate(normalized, "C")
 
-    def column(self, column: _Column) -> Any:
-        """Return a string column normalized to NFC."""
-        return self._form(column, column.compared)
+def _mariadb_form(column: _Column, expression: Any) -> Any:
+    """Return a string expression of MariaDB in UTF-8, lowered if the column ignores the case, under the binary collation.
 
-    def operand(self, column: _Column, value: str) -> Any:
-        """Return a string normalized to NFC, in Python then in the database."""
-        normalized = unicodedata.normalize("NFC", value)
-        return self._form(column, Value(normalized, output_field=TextField()))
+    The comparison does not depend on the collation of the column. MariaDB
+    cannot normalize a string to NFC, so a stored string in another form does
+    not match its NFC form. lower() follows the case tables of Unicode under
+    an uca1400 collation only. The collations without padding keep the
+    trailing spaces.
+    """
+    if not column.casefolded:
+        return _mariadb_exact(expression)
+
+    lowered = Lower(Collate(_utf8mb4(expression), "utf8mb4_uca1400_nopad_as_cs"))
+    return Collate(lowered, "utf8mb4_nopad_bin")
+
+
+def _mariadb_exact(expression: Any) -> Any:
+    """Return a string expression of MariaDB in UTF-8, under the binary collation without padding."""
+    return Collate(_utf8mb4(expression), "utf8mb4_nopad_bin")
+
+
+def _as_is(expression: Any) -> Any:
+    return expression
 
 
 def _normalize(expression: Any) -> Func:
@@ -184,6 +237,41 @@ class _KeyFunction(_Comparator):
         return Q(Exact(Substr(left, start), right))
 
 
+_MARIADB_VERSION = (10, 10)
+"""The first version of MariaDB with the uca1400 collations."""
+
+_FORMS: dict[str, tuple[Callable[[_Column, Any], Any], Callable[[Any], Any]]] = {
+    "postgresql": (_postgresql_form, _as_is),
+    "mariadb": (_mariadb_form, _mariadb_exact),
+}
+"""How each database that approaches the default comparison key writes a string to compare it, and an identifier, by vendor."""
+
+
+def _utf8mb4(expression: Any) -> Func:
+    """Convert a string expression to utf8mb4 in MariaDB. The column may use another character set."""
+    return Func(
+        expression,
+        template="CONVERT(%(expressions)s USING utf8mb4)",
+        output_field=TextField(),
+    )
+
+
+def _vendor(connection: Any) -> str:
+    """Return the name of the database of a connection, telling MariaDB apart from MySQL.
+
+    MariaDB before 10.10 lacks the uca1400 collations, so it is named mysql,
+    as a backend that does not tell whether it runs MariaDB.
+    """
+    if (
+        connection.vendor == "mysql"
+        and getattr(connection, "mysql_is_mariadb", False)
+        and connection.mysql_version >= _MARIADB_VERSION
+    ):
+        return "mariadb"
+
+    return str(connection.vendor)
+
+
 def _comparator(
     vendor: str, policy: ScimPolicy, mappings: Iterable[ResourceMapping]
 ) -> _Comparator:
@@ -191,15 +279,15 @@ def _comparator(
     if vendor == "sqlite":
         return _KeyFunction(policy, mappings)
 
-    if vendor == "postgresql":
+    if vendor in _FORMS:
         if policy.comparison_key is not default_comparison_key:
             warnings.warn(
-                "The postgresql storage cannot compare strings with the comparison "
+                f"The {vendor} storage cannot compare strings with the comparison "
                 "key of the policy: filters and uniqueness checks only approach it",
                 stacklevel=2,
             )
 
-        return _Normalizer(policy)
+        return _Collator(policy, *_FORMS[vendor])
 
     warnings.warn(
         f"The {vendor} storage compares strings with lower() and the collation "

@@ -35,6 +35,7 @@ class UserRecord(models.Model):
     employee_number = models.TextField(null=True)
     preferred_language = models.TextField()
     email = models.EmailField(blank=True)
+    serial = models.CharField(max_length=32, unique=True, null=True)
     badge_number = models.IntegerField(null=True)
     score = models.FloatField(null=True)
     code = CodeField(null=True)
@@ -150,7 +151,7 @@ class BadgeRecord(models.Model):
 class Person(models.Model):
     """A model for the mappings the checks refuse."""
 
-    id = models.TextField(primary_key=True)
+    id = models.CharField(primary_key=True, max_length=64)
     user_name = models.TextField()
     serial = models.TextField(unique=True, null=True)
     data = models.JSONField(null=True)

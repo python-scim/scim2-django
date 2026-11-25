@@ -1622,7 +1622,7 @@ dev = [
     { name = "pytest-postgresql", specifier = ">=10.0.0" },
     { name = "scim2-client", specifier = ">=0.14.1" },
     { name = "scim2-server", extras = ["cursor"], specifier = ">=0.8.8" },
-    { name = "scim2-tester", extras = ["testing"], specifier = ">=0.6.4" },
+    { name = "scim2-tester", extras = ["testing"], specifier = ">=0.6.6" },
     { name = "tox-uv", specifier = ">=1.36.0" },
 ]
 doc = [
@@ -1666,15 +1666,15 @@ cursor = [
 
 [[package]]
 name = "scim2-tester"
-version = "0.6.5"
+version = "0.6.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "scim2-client" },
     { name = "scim2-models" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/27/60/9613fdfbc44ea2a669d08d1ec1c6c246c6afa071356a08b1d19b02e314f1/scim2_tester-0.6.5.tar.gz", hash = "sha256:e31bf17eef9adda3dcb13932b055a0581b24ea129ce451831b25fe9bdd3ba2eb", size = 38923, upload-time = "2026-11-17T15:08:35.538Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/25/a4/85c9eb442a4ca29fc75cc12af3dfec5f8f28546684530450fe502c6b2d0b/scim2_tester-0.6.6.tar.gz", hash = "sha256:0c44bcba955e72be7033269b67a5f3bfe619b939c03c9393ff3bb2abb1cd4591", size = 39394, upload-time = "2026-11-25T13:32:30.816Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/97/0b/00a52aa3c4f00ea748a50ed290f6b90c85bc1418b35d2119130dff7c73f0/scim2_tester-0.6.5-py3-none-any.whl", hash = "sha256:ee49ea896b63562cb466f913b66f35593428b38b691450ed10058245c83404c4", size = 52744, upload-time = "2026-11-17T15:08:34.262Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/8a/f0e234d2ee22b908e903be92fdcec855b160d4d28369981b655660764099/scim2_tester-0.6.6-py3-none-any.whl", hash = "sha256:d92afd79b2f9e9c6d8ee8cb6ca36bdd61c62632f0c9c51db7f2e6a3420b869b6", size = 53179, upload-time = "2026-11-25T13:32:29.645Z" },
 ]
 
 [package.optional-dependencies]

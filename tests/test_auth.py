@@ -38,16 +38,6 @@ class TestAccounts(ScimServerContract):
 
     seed = 3330931774
     expected_results = {
-        ("User", "check_add_attribute", "emails"): (
-            Status.ERROR,
-            "scim2-tester sends primary=false in a lone entry, which reads back as "
-            "the primary one",
-        ),
-        ("User", "check_replace_attribute", "emails"): (
-            Status.ERROR,
-            "scim2-tester sends primary=false in a lone entry, which reads back as "
-            "the primary one",
-        ),
         ("User", "check_remove_attribute", "active"): (
             Status.ERROR,
             "is_active cannot hold no value, so the storage refuses to remove active",

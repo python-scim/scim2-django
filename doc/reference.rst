@@ -80,7 +80,8 @@ The checks report the following errors and warnings:
        :class:`~scim2_django.storage.Link` does not fit it. A ``Many`` needs the reverse relation
        of a foreign key with ``on_delete=CASCADE`` and without null. A ``Link`` holding several
        entries needs a many-to-many relation. A ``Link`` holding one entry needs a foreign key or
-       a one-to-one field, with ``null=True`` unless the attribute is required.
+       a one-to-one field. That field needs ``null=True``, unless every resource holds the
+       attribute: the attribute is required, and so is its extension, if any.
    * - ``scim2_django.E004``
      - The version is not an integer field.
    * - ``scim2_django.E005``
@@ -89,10 +90,11 @@ The checks report the following errors and warnings:
      - ``meta.created`` or ``meta.lastModified`` is mapped to a field that is not a
        :class:`~django.db.models.DateTimeField`.
    * - ``scim2_django.E007``
-     - The entries of a :class:`~scim2_django.storage.Many` hold a write-only value, or a
-       read-only value next to written ones. Each write replaces the entries, so these values
-       would be lost. Or a field of an :class:`~scim2_django.storage.Entry` is write-only, cannot
-       hold no value, or is read-only next to written ones: the entry could not be removed.
+     - The entries of a :class:`~scim2_django.storage.Many` hold a value hidden from clients,
+       write-only or never returned, or a read-only value next to written ones. Each write
+       replaces the entries, so these values would be lost. Or a field of an
+       :class:`~scim2_django.storage.Entry` is hidden from clients, cannot hold no value, or is
+       read-only next to written ones: the entry could not be removed.
    * - ``scim2_django.E008``
      - A string attribute is mapped to a field or an expression that does not hold text.
    * - ``scim2_django.E009``
@@ -104,10 +106,19 @@ The checks report the following errors and warnings:
        relation. Or the related model has a field without default that the mapping
        leaves out, so the storage cannot create its records. Or the related model holds a date,
        so each write creates its records, and has a mapped field without null nor default.
+   * - ``scim2_django.E011``
+     - An attribute the storage never reads, such as a write-only one, is mapped to a generated
+       field, which the storage never writes.
    * - ``scim2_django.W001``
      - A readable string attribute is mapped to a text field that converts the values it reads,
        such as a field decrypting them. Filters and sorts compare the stored values, not the
        values clients read.
+   * - ``scim2_django.W002``
+     - A field of the resource model has neither null nor a default, and the storage never
+       writes it. Creating a resource then fails. Map the field, or give it a default. A text
+       field that is not unique needs neither: Django stores an empty string. Silence this
+       warning if the project fills the field itself, in :meth:`~django.db.models.Model.save`
+       or a :data:`~django.db.models.signals.pre_save` signal.
 
 .. _url-names:
 

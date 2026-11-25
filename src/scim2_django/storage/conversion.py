@@ -24,7 +24,7 @@ from scim2_models import Resource
 from .mapping import ResourceMapping
 from .mapping import _Collection
 from .mapping import _Column
-from .mapping import _needs_value
+from .mapping import _field_needs_value
 from .mapping import _Storage
 
 
@@ -306,13 +306,13 @@ def _keeps(column: _Column, creating: bool) -> bool:
     """Tell whether a missing value leaves a field as it is.
 
     When creating the record, the field keeps its default, unless to_field
-    gives its value for no value. A write-only value is kept, since a resource
-    never carries it back.
+    gives its value for no value. A value clients never read is kept, since
+    a resource never carries it back.
     """
     if creating:
         return not column.transformed
 
-    return not column.readable
+    return column.concealed
 
 
 def _stored(column: _Column, value: Any) -> Any:
@@ -437,7 +437,7 @@ def _check_creatable(
     given = {column for column, _ in written}
     for column in mapping._columns.values():
         if column.relation is relation and column not in given:
-            if not column.nullable and _needs_value(column.field):  # type: ignore[arg-type]
+            if not column.nullable and _field_needs_value(column.field):  # type: ignore[arg-type]
                 raise InvalidValueException(
                     detail=f"'{column.binding.urn}' is required on this server"
                 )
@@ -530,7 +530,7 @@ def _check_storable(
         if stored is not None:
             current = _comparable(Path(binding.urn).get(stored, strict=False))
 
-        if storage == _Storage.written:
+        if storage in (_Storage.written, _Storage.write_only):
             _check_written(mapping, binding, value, current, stored is None)
             continue
 
@@ -574,7 +574,11 @@ def _check_written(
             detail=f"'{binding.urn}' is required on this server"
         )
 
-    if current is not None and not mapping._nullable(binding.urn):
+    if (
+        current is not None
+        and not mapping._nullable(binding.urn)
+        and not mapping._concealed(binding.urn)
+    ):
         raise MutabilityException(
             attribute=binding.urn,
             detail=f"'{binding.urn}' cannot be removed on this server",

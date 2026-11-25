@@ -327,8 +327,14 @@ def test_an_entry_cannot_be_transformed():
 @pytest.mark.parametrize(
     ("value", "error"),
     [
-        (Transformed("nope", to_field=str), "scim2_django.E001"),
-        (Transformed("manager", to_field=str), "scim2_django.E002"),
+        (
+            Transformed("nope", expression=F("title"), to_field=str),
+            "scim2_django.E001",
+        ),
+        (
+            Transformed("manager", expression=F("title"), to_field=str),
+            "scim2_django.E002",
+        ),
         (
             Transformed("title", expression=F("badge_number"), to_field=str),
             "scim2_django.E008",

@@ -1,6 +1,35 @@
 Changelog
 =========
 
+[Unreleased]
+------------
+
+Added
+^^^^^
+- :meth:`ResourceMapping.schemas() <scim2_django.storage.ResourceMapping.schemas>` publishes
+  ``required`` for an attribute the storage cannot create a resource without, and for a complex
+  attribute holding such a sub-attribute.
+- The warning ``scim2_django.W002`` reports a field of the resource model that needs a value, and
+  that the storage never writes. Creating a resource then raises a database error.
+- The check ``scim2_django.E011`` refuses an attribute that the storage never reads, mapped to a
+  generated field.
+
+Changed
+^^^^^^^
+- An attribute mapped with ``readable=False``, or to a
+  :class:`~scim2_django.storage.Transformed` without ``expression``, is published ``writeOnly``
+  and never returned.
+- An attribute that the server never returns, such as a write-only one, is published optional,
+  even when its schema requires it. It cannot be filtered nor sorted on. A replacement without
+  its value keeps it, so a PATCH cannot remove it. The check ``scim2_django.E007`` refuses it in
+  the entries of a :class:`~scim2_django.storage.Many` or an
+  :class:`~scim2_django.storage.Entry`. A link does not display it.
+- A mapping refuses an attribute that clients could neither read nor write, and an immutable
+  attribute that the storage would not read.
+- The check ``scim2_django.E003`` refuses a foreign key without null for a required
+  :class:`~scim2_django.storage.Link` of an optional extension. A resource without the extension
+  raised a database error.
+
 [0.1.1] - 2026-11-24
 --------------------
 

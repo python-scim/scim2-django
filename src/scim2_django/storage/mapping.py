@@ -40,11 +40,13 @@ from django.urls import get_resolver
 from pydantic import BaseModel
 from scim2_models import Attribute as SchemaAttribute
 from scim2_models import AttributeBinding
+from scim2_models import Extension
 from scim2_models import Mutability
 from scim2_models import Path
 from scim2_models import Required
 from scim2_models import Resource
 from scim2_models import ResponseParameters
+from scim2_models import Returned
 from scim2_models import Schema
 from scim2_models import Uniqueness
 
@@ -97,6 +99,7 @@ class _Storage(Enum):
 
     written = "written"
     read_only = "read only"
+    write_only = "write only"
     derived = "derived"
     ref = "ref"
     link_type = "link type"
@@ -110,6 +113,9 @@ class Attribute:
     :param readable: Whether the storage reads the attribute. When
         :data:`False`, the attribute is write-only, such as a password: the
         storage never returns it, nor filters or sorts on it.
+        :meth:`ResourceMapping.schemas` publishes it ``writeOnly`` and never
+        returned. An immutable attribute cannot be :data:`False`: the storage
+        reads it to keep it from changing.
     :param writable: Whether the storage writes the attribute. When
         :data:`False`, the attribute is read-only.
     """
@@ -148,8 +154,8 @@ class Transformed:
     send through ``to_field``. The two must agree: ``to_field`` gives back the
     field value ``expression`` was computed from.
 
-    An attribute without ``expression`` is write-only, such as a password. An
-    attribute without ``to_field`` is read-only. ``id`` needs both: the
+    An attribute without ``expression`` is write-only, such as a password, so
+    it cannot be immutable. An attribute without ``to_field`` is read-only. ``id`` needs both: the
     storage finds a resource by its ``id`` through ``to_field``, so that the
     database uses the index of the field.
 
@@ -330,6 +336,15 @@ class _Column:
         )
 
     @property
+    def concealed(self) -> bool:
+        """Whether clients never read the value: the storage does not read it, or the server never returns it.
+
+        Filters and sorts cannot compare it, and a replacement without it
+        keeps it.
+        """
+        return not self.readable or _never_returned(self.binding)
+
+    @property
     def empty_string(self) -> bool:
         """Whether the field holds an empty string for no value.
 
@@ -368,7 +383,7 @@ class _Column:
         if self.field is None or self.nullable or self.relation is not None:
             return False
 
-        return _needs_value(self.field)
+        return _field_needs_value(self.field)
 
     @property
     def enumeration(self) -> list[Any] | None:
@@ -653,6 +668,22 @@ class ResourceMapping:
         :meth:`ScimProvider.from_discovery <scim2_models.ScimProvider.from_discovery>`,
         and pass it to the storage.
 
+        An attribute is ``required`` when the storage cannot create a record
+        without its value: its field has neither null nor a default, and gets
+        no value by itself. A string held by a text field never makes it
+        required, since Django stores an empty string. A field of a related
+        record never does either. Nor does a :class:`Transformed` field: its
+        ``to_field`` returns the value stored when none is given. An attribute
+        never returned, such as a write-only one, is optional, even when its
+        schema requires it: clients cannot send back a value they never read.
+        A field with a default but without null is optional, but its value
+        cannot be removed.
+
+        A required attribute of an extension only constrains the resources
+        holding that extension. Yet the storage refuses a resource without the
+        extension when the field of such an attribute needs a value. Declare
+        the extension required in the resource type, so that clients know.
+
         :returns: The schema of the resource, then the schemas of its extensions.
         :raises ~django.core.exceptions.ImproperlyConfigured: When a field does
             not fit its attribute.
@@ -668,7 +699,11 @@ class ResourceMapping:
         """
         apps.check_models_ready()
         if self._messages is None:
-            self._messages = list(self._resolve_fields())
+            messages = list(self._resolve_fields())
+            if not any(message.is_serious() for message in messages):
+                messages.extend(self._check_unwritten())
+
+            self._messages = messages
 
         return self._messages
 
@@ -693,16 +728,47 @@ class ResourceMapping:
         return schema.model_copy(update={"attributes": attributes})
 
     def _restrict_attribute(self, urn: str, attribute: Any) -> Any:
-        """Return an attribute of a schema as the mapping stores it, or None when it stores nothing of it."""
-        if attribute.sub_attributes:
-            return self._restrict_complex(urn, attribute)
+        """Return an attribute of a schema as the mapping stores it, or None when it stores nothing of it.
 
+        An attribute never returned is optional, since clients cannot send
+        back a value they never read.
+        """
+        if attribute.sub_attributes:
+            restricted = self._restrict_complex(urn, attribute)
+        else:
+            restricted = self._restrict_simple(urn, attribute)
+
+        if restricted is None or not (
+            restricted.returned == Returned.never
+            or restricted.mutability == Mutability.write_only
+        ):
+            return restricted
+
+        return restricted.model_copy(update={"required": Required.false})
+
+    def _restrict_simple(self, urn: str, attribute: Any) -> Any:
+        """Return a simple attribute of a schema as the mapping stores it, or None when it stores nothing of it.
+
+        A single attribute whose field needs a value is required. An
+        attribute the storage never reads is write-only.
+        """
         storage = self._storage(urn)
         if storage is None:
             return None
 
-        if storage in (_Storage.written, _Storage.link_type):
+        if storage == _Storage.link_type:
             return attribute
+
+        if storage == _Storage.write_only:
+            return attribute.model_copy(
+                update={"mutability": Mutability.write_only, "returned": Returned.never}
+            )
+
+        if storage == _Storage.written:
+            if attribute.multi_valued or not self._needs_value(urn):
+                return attribute
+
+            return attribute.model_copy(update={"required": Required.true})
 
         if storage == _Storage.constant:
             constant = self._constant_value(urn)
@@ -718,7 +784,13 @@ class ResourceMapping:
         return attribute.model_copy(update={"mutability": Mutability.read_only})
 
     def _restrict_complex(self, urn: str, attribute: Any) -> Any:
-        """Return a complex attribute with the sub-attributes the mapping stores, or None when it stores none."""
+        """Return a complex attribute with the sub-attributes the mapping stores, or None when it stores none.
+
+        A single complex attribute is required when the field of one of its
+        sub-attributes needs a value, since the storage refuses a resource
+        without it. A complex attribute whose sub-attributes are all never
+        returned is never returned either.
+        """
         sub_attributes = [
             restricted
             for sub_attribute in attribute.sub_attributes
@@ -736,25 +808,37 @@ class ResourceMapping:
             sub_attribute.mutability != Mutability.read_only
             for sub_attribute in sub_attributes
         )
-        mutability = attribute.mutability if written else Mutability.read_only
-        return attribute.model_copy(
-            update={"sub_attributes": sub_attributes, "mutability": mutability}
-        )
+        update: dict[str, Any] = {
+            "sub_attributes": sub_attributes,
+            "mutability": attribute.mutability if written else Mutability.read_only,
+        }
+        if all(
+            sub_attribute.returned == Returned.never for sub_attribute in sub_attributes
+        ):
+            update["returned"] = Returned.never
+            if attribute.mutability == Mutability.read_write:
+                update["mutability"] = Mutability.write_only
+
+        if not attribute.multi_valued and any(
+            self._needs_value(f"{urn}.{sub_attribute.name}")
+            for sub_attribute in sub_attributes
+        ):
+            update["required"] = Required.true
+
+        return attribute.model_copy(update=update)
 
     def _storage(self, urn: str) -> _Storage | None:
         """Return how the mapping stores the attribute of a URN, or None when it does not store it."""
         key = urn.lower()
         for column in self._columns.values():
             if column.binding.urn.lower() == key:
-                return _Storage.written if column.writable else _Storage.read_only
+                return _column_storage(column)
 
         for collection in self._all_collections():
             if collection.owned:
                 for column in collection.columns.values():
                     if column.binding.urn.lower() == key:
-                        return (
-                            _Storage.written if column.writable else _Storage.read_only
-                        )
+                        return _column_storage(column)
 
                 continue
 
@@ -849,14 +933,53 @@ class ResourceMapping:
             if column.binding.urn.lower() == key
         )
 
-    def _required(self, urn: str) -> bool:
-        """Tell whether a new record needs a value for the attribute of a URN."""
+    def _concealed(self, urn: str) -> bool:
+        """Tell whether clients never read the attribute of a URN."""
         key = urn.lower()
         return any(
-            column.required
+            column.concealed
             for column in self._columns.values()
             if column.binding.urn.lower() == key
         )
+
+    def _required(self, urn: str) -> bool:
+        """Tell whether a new record needs a value for the attribute of a URN."""
+        return any(self._required_columns(urn))
+
+    def _needs_value(self, urn: str) -> bool:
+        """Tell whether clients must give a value for the attribute of a URN, in a resource or in an entry of a Many.
+
+        An attribute never returned needs none, since clients never read it
+        back before a replacement.
+        """
+        return any(
+            column.writable and not column.concealed
+            for column in self._required_columns(urn, entries=True)
+        )
+
+    def _required_columns(
+        self, urn: str, *, entries: bool = False
+    ) -> Iterator[_Column]:
+        """Yield the columns of the attribute of a URN that need a value in a new record.
+
+        With entries, also yield those of the entries of a Many.
+        """
+        key = urn.lower()
+        columns: Iterable[_Column] = self._columns.values()
+        if entries:
+            columns = [
+                *columns,
+                *(
+                    column
+                    for collection in self._all_collections()
+                    if collection.owned
+                    for column in collection.columns.values()
+                ),
+            ]
+
+        for column in columns:
+            if column.required and column.binding.urn.lower() == key:
+                yield column
 
     def _sub_columns(self, binding: AttributeBinding) -> list[_Column]:
         """Return the mapped sub-attributes of a complex attribute holding a single value."""
@@ -1023,7 +1146,7 @@ class ResourceMapping:
                 continue
 
             column = self._columns.get(_key(binding))
-            if column is not None and column.readable:
+            if column is not None and not column.concealed:
                 return column
 
         return None
@@ -1097,7 +1220,39 @@ class ResourceMapping:
         if _key(binding) in fields and not isinstance(value, str):
             raise ValueError(f"{path!r} must be mapped to the name of a field")
 
+        self._check_read_and_written(path, binding, value)
         self._declared[path] = (binding, value)
+
+    def _check_read_and_written(
+        self, path: str, binding: AttributeBinding, value: Any
+    ) -> None:
+        """Refuse an attribute that clients could neither read nor write, or an immutable one the storage would not read."""
+        mutabilities = _mutabilities(binding)
+        unread = (isinstance(value, Attribute) and not value.readable) or (
+            isinstance(value, Transformed) and value.expression is None
+        )
+        if (
+            unread
+            and Mutability.immutable in mutabilities
+            and Mutability.write_only not in mutabilities
+        ):
+            raise ValueError(
+                f"{path!r} is immutable, so the storage reads it to keep it "
+                "from changing"
+            )
+
+        read = (
+            Mutability.write_only not in mutabilities
+            and not _never_returned(binding)
+            and not unread
+        )
+        written = Mutability.read_only not in mutabilities and not (
+            isinstance(value, Computed)
+            or (isinstance(value, Attribute) and not value.writable)
+            or (isinstance(value, Transformed) and value.to_field is None)
+        )
+        if not (read or written):
+            raise ValueError(f"Clients could neither read nor write {path!r}")
 
     def _check_many(
         self, path: str, binding: AttributeBinding, many: Many, is_complex: bool
@@ -1328,10 +1483,7 @@ class ResourceMapping:
         A write-only attribute is never read. A read-only attribute, a
         generated field and a computed expression are never written.
         """
-        mutabilities = {
-            binding.model.get_field_annotation(binding.field_name, Mutability),
-            binding.get_annotation(Mutability),
-        }
+        mutabilities = _mutabilities(binding)
         readable = Mutability.write_only not in mutabilities
         writable = Mutability.read_only not in mutabilities
         if isinstance(value, Computed):
@@ -1415,6 +1567,14 @@ class ResourceMapping:
                 f"{path!r} is mapped to {name!r}, which is a relation: "
                 "map it with Many or Link",
                 "scim2_django.E002",
+            )
+            return None
+
+        if field.generated and not readable:
+            yield self._error(
+                f"{path!r} is never read, and {name!r} is a generated field, "
+                "which the storage never writes",
+                "scim2_django.E011",
             )
             return None
 
@@ -1508,7 +1668,7 @@ class ResourceMapping:
                     continue
 
                 # Django gives an empty string to a text field without value.
-                if _needs_value(field) and not field.empty_strings_allowed:
+                if _field_needs_value(field) and not field.empty_strings_allowed:
                     yield self._error(
                         f"{relation.get_accessor_name()!r} leads to "
                         f"{relation.related_model._meta.label} records, whose "
@@ -1535,13 +1695,67 @@ class ResourceMapping:
             if column.relation not in dated or _key(column.binding) in dates:
                 continue
 
-            if not column.nullable and _needs_value(column.field):  # type: ignore[arg-type]
+            if not column.nullable and _field_needs_value(column.field):  # type: ignore[arg-type]
                 yield self._error(
                     f"{column.relation.get_accessor_name()!r} leads to records "
                     "holding dates, which each write creates, so the field of "
                     f"{column.binding.urn!r} needs null or a default",
                     "scim2_django.E010",
                 )
+
+    def _check_unwritten(self) -> Iterator[checks.CheckMessage]:
+        """Warn about a field of the resource record that needs a value the storage never writes.
+
+        Django gives an empty string to a text field without value, unless
+        it is unique: a second record could not hold it. The parent link of an
+        inherited model is set when the parent is saved.
+        """
+        dates = {self._created, self._last_modified}
+        written = {
+            column.field.name
+            for column in self._columns.values()
+            if column.field is not None
+            and column.relation is None
+            and (column.writable or column in dates)
+        }
+        written.update(
+            collection.relation.name
+            for collection in self._all_collections()
+            if collection.single and not collection.owned and collection.writable
+        )
+        for field in self.record._meta.concrete_fields:
+            if (
+                field.name in written
+                or not _field_needs_value(field)
+                or (field.empty_strings_allowed and not field.unique)
+                or (field.remote_field is not None and field.remote_field.parent_link)
+            ):
+                continue
+
+            advice = (
+                "the storage counts the writes from it, but never sets it on "
+                "creation: give it a default"
+                if field.name == self.version
+                else "the storage never writes it, so creating a resource "
+                "fails: map it, or give it a default"
+            )
+            yield checks.Warning(
+                f"The field {field.name!r} of {self.record._meta.label} needs a "
+                f"value, but {advice}",
+                obj=self,
+                id="scim2_django.W002",
+            )
+
+    def _always_held(self, binding: AttributeBinding) -> bool:
+        """Tell whether every resource holds an attribute: it is required, and so is its extension."""
+        if not _required(binding):
+            return False
+
+        if not issubclass(binding.model, Extension):
+            return True
+
+        annotation = self.model.get_field_annotation(binding.model.__name__, Required)
+        return bool(annotation == Required.true)
 
     def _relations(self) -> list[Any]:
         """Return the relations leading to the records holding mapped fields, by name."""
@@ -1649,11 +1863,11 @@ class ResourceMapping:
             column.in_entry = True
 
         values = columns.values()
-        if not all(column.readable and column.nullable for column in values):
+        if any(column.concealed or not column.nullable for column in values):
             yield self._error(
                 f"The entry of {path!r} exists when one of its fields has a "
                 "value, and a write removing it empties them, so they cannot "
-                "be write-only nor without null",
+                "be hidden from clients nor without null",
                 "scim2_django.E007",
             )
             return None
@@ -1692,15 +1906,15 @@ class ResourceMapping:
         """Refuse entries that a write would partly lose.
 
         A write replaces the entries, so the values a client never sends back
-        would be lost: those of a write-only sub-attribute, and those of a
-        read-only one next to written ones. A PATCH adding entries would lose
+        would be lost: those of a sub-attribute hidden from clients, and those
+        of a read-only one next to written ones. A PATCH adding entries would lose
         the write-only ones, since the server patches the resource it read.
         """
         columns = collection.columns.values()
-        if not all(column.readable for column in columns):
+        if any(column.concealed for column in columns):
             yield self._error(
                 f"The entries of {path!r} are replaced on each write, "
-                "so they cannot hold write-only values",
+                "so they cannot hold values hidden from clients",
                 "scim2_django.E007",
             )
         elif collection.writable and not all(column.writable for column in columns):
@@ -1744,9 +1958,14 @@ class ResourceMapping:
                 )
                 return None
 
-            if collection.single and not relation.null and not _required(binding):
+            if (
+                collection.single
+                and not relation.null
+                and not self._always_held(binding)
+            ):
                 yield self._error(
-                    f"{path!r} can be removed, so {link.relation!r} needs null=True",
+                    f"{path!r} can be removed, or left out with its extension, "
+                    f"so {link.relation!r} needs null=True",
                     "scim2_django.E003",
                 )
                 return None
@@ -1782,15 +2001,39 @@ def _overlap(key: tuple[Any, ...], other: tuple[Any, ...]) -> bool:
     return key == other or (key[:2] == other[:2] and None in (key[2], other[2]))
 
 
+def _mutabilities(binding: AttributeBinding) -> set[Mutability | None]:
+    """Return the mutabilities an attribute is annotated with, on its own or through its parent."""
+    return {
+        binding.model.get_field_annotation(binding.field_name, Mutability),
+        binding.get_annotation(Mutability),
+    }
+
+
+def _column_storage(column: _Column) -> _Storage:
+    """Return how a column stores its attribute: read and written, or only one of them."""
+    if not column.writable:
+        return _Storage.read_only
+
+    return _Storage.written if column.readable else _Storage.write_only
+
+
+def _never_returned(binding: AttributeBinding) -> bool:
+    """Tell whether an attribute is never returned to clients, on its own or through its parent."""
+    return Returned.never in (
+        binding.model.get_field_annotation(binding.field_name, Returned),
+        binding.get_annotation(Returned),
+    )
+
+
 def _required(binding: AttributeBinding) -> bool:
-    """Tell whether a resource always holds an attribute."""
+    """Tell whether an attribute is required where it is defined, in the resource or in its extension."""
     return Required.true in (
         binding.model.get_field_annotation(binding.field_name, Required),
         binding.get_annotation(Required),
     )
 
 
-def _needs_value(field: "models.Field[Any, Any]") -> bool:
+def _field_needs_value(field: "models.Field[Any, Any]") -> bool:
     """Tell whether a new record needs a value for a field: Django fills it neither from a default nor by itself."""
     return not (
         field.null

@@ -268,7 +268,10 @@ def test_the_fields_of_an_entry_are_checked(entry, error):
 
 def test_a_mapping_with_an_entry_passes_the_checks():
     users = ResourceMapping(
-        User, UserRecord, {"id": "id", "emails": EMAILS}, version="version"
+        User,
+        UserRecord,
+        {"id": "id", "userName": "user_name", "emails": EMAILS},
+        version="version",
     )
 
     assert users.check() == []

@@ -5,7 +5,10 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError
 from django.db import connection
 from django.db.models import F
+from django.urls import path
 from scim2_models import Group
+from scim2_models import InvalidFilterException
+from scim2_models import InvalidPathException
 from scim2_models import InvalidValueException
 from scim2_models import NotFoundException
 from scim2_models import PreconditionFailedException
@@ -18,6 +21,7 @@ from scim2_models import User
 from scim2_server.utils import load_default_provider
 from scim2_server.utils import load_default_service_provider_config
 
+from scim2_django import ScimSite
 from scim2_django.storage import DjangoStorage
 from scim2_django.storage import ResourceMapping
 from scim2_django.storage.comparison import _vendor
@@ -25,11 +29,16 @@ from scim2_django.storage.comparison import _vendor
 from .mappings import groups_mapping
 from .mappings import users_mapping
 from .models import EmailRecord
+from .models import Locker
 from .models import Person
 from .models import UserRecord
+from .models import Volunteer
+from .test_mapping import OWNED
+from .test_mapping import Owned
 
 pytestmark = pytest.mark.django_db
 
+SCIM_JSON = "application/scim+json"
 NOW = datetime.datetime(2026, 11, 20, 8, 0, tzinfo=datetime.UTC)
 
 
@@ -319,21 +328,18 @@ def test_a_value_the_collation_of_a_unique_column_ignores_is_not_unique(server):
 @pytest.fixture
 def people():
     """Return a server of people, whose identifiers are text: abc, b and C."""
-    mentor = UserRecord.objects.create(user_name="m", preferred_language="fr")
     for pk in ["abc", "b", "C"]:
-        Person.objects.create(
-            id=pk,
-            user_name=pk,
-            enabled=True,
-            mentor=mentor,
-            created=NOW,
-            last_modified=NOW,
-        )
+        Person.objects.create(id=pk, user_name=pk, created=NOW, last_modified=NOW)
 
     people = ResourceMapping(
         User,
         Person,
-        {"id": "id", "userName": "user_name", "meta.created": "created"},
+        {
+            "id": "id",
+            "userName": "user_name",
+            "meta.created": "created",
+            "meta.lastModified": "last_modified",
+        },
         version="version",
     )
     return Server(mappings={"User": people, "Group": groups_mapping({"members": None})})
@@ -359,3 +365,74 @@ def test_cursors_page_once_through_text_identifiers(people):
         )
 
     assert sorted(r.id for page in pages for r in page.resources) == ["C", "abc", "b"]
+
+
+@pytest.fixture
+def volunteers(serve):
+    """Return a client of a server publishing the schemas of its mapping, where active is required."""
+    mapping = ResourceMapping(
+        User,
+        Volunteer,
+        {"id": "id", "userName": "user_name", "active": "active"},
+        version="version",
+    )
+    provider = ScimProvider.from_discovery(
+        mapping.schemas(),
+        [ResourceType.from_resource(User)],
+        config=load_default_service_provider_config(),
+    )
+    site = ScimSite(
+        DjangoStorage({"User": mapping}, provider),
+        provider,
+        authenticate=lambda request: None,
+    )
+    return serve(path("scim/v2/", site.urls))
+
+
+def scim_type(response):
+    return (response.status_code, response.json().get("scimType"))
+
+
+def test_a_write_without_a_required_value_is_refused(volunteers):
+    """Each write without whether the volunteer is active is refused."""
+    user = {"schemas": [User.__schema__], "userName": "bjensen"}
+
+    response = volunteers.post("/scim/v2/Users", user, content_type=SCIM_JSON)
+    assert response.status_code == 400
+
+    response = volunteers.post(
+        "/scim/v2/Users", user | {"active": True}, content_type=SCIM_JSON
+    )
+    assert response.status_code == 201
+    location = f"/scim/v2/Users/{response.json()['id']}"
+
+    response = volunteers.put(location, user, content_type=SCIM_JSON)
+    assert scim_type(response) == (400, "invalidValue")
+
+    remove = {
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [{"op": "remove", "path": "active"}],
+    }
+    response = volunteers.patch(location, remove, content_type=SCIM_JSON)
+    assert scim_type(response) == (400, "mutability")
+    assert Volunteer.objects.get().active is True
+
+
+@pytest.mark.parametrize(
+    "search_request,error",
+    [
+        (SearchRequest(filter=f"{OWNED}:secret eq 7"), InvalidFilterException),
+        (SearchRequest(sort_by=f"{OWNED}:secret"), InvalidPathException),
+    ],
+    ids=["filter", "sort"],
+)
+def test_a_value_never_returned_cannot_be_searched(search_request, error):
+    """A client could guess the secret by filtering or sorting on it."""
+    lockers = ResourceType.from_resource(User[Owned])
+    mapping = ResourceMapping(
+        User[Owned], Locker, {"id": "id", f"{OWNED}:secret": "code"}
+    )
+    storage = DjangoStorage({"User": mapping})
+
+    with pytest.raises(error):
+        storage.search([lockers], search_request)

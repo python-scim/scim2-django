@@ -6,6 +6,7 @@ from django.db import IntegrityError
 from django.db import connection
 from django.db.models import F
 from django.urls import path
+from scim2_models import ConflictException
 from scim2_models import Group
 from scim2_models import InvalidFilterException
 from scim2_models import InvalidPathException
@@ -28,8 +29,12 @@ from scim2_django.storage.comparison import _vendor
 
 from .mappings import groups_mapping
 from .mappings import users_mapping
+from .models import AliasRecord
+from .models import BadgeRecord
 from .models import EmailRecord
 from .models import Locker
+from .models import LogRecord
+from .models import PassRecord
 from .models import Person
 from .models import UserRecord
 from .models import Volunteer
@@ -154,16 +159,130 @@ def test_a_unique_value_taken_in_the_meantime_is_refused():
     assert UserRecord.objects.count() == 1
 
 
-def test_another_integrity_error_goes_up(server, monkeypatch):
-    """An error that neither the uniqueness nor a unique index explains is not hidden."""
+@pytest.mark.parametrize(
+    "cause", [ValueError("check"), None], ids=["database", "project"]
+)
+def test_another_integrity_error_goes_up(server, monkeypatch, cause):
+    """An error that neither the uniqueness, a unique index nor a foreign key explains is not hidden."""
 
     def refuse(*args, **kwargs):
-        raise IntegrityError("CHECK constraint failed") from ValueError("check")
+        raise IntegrityError("CHECK constraint failed") from cause
 
     monkeypatch.setattr(UserRecord, "save", refuse)
 
     with pytest.raises(IntegrityError):
         server.create_user("bjensen")
+
+
+@pytest.mark.parametrize(
+    "model", [BadgeRecord, PassRecord], ids=["protect", "restrict"]
+)
+def test_a_user_another_record_refers_to_cannot_be_deleted(server, model):
+    """A record refers to the user through a PROTECT or RESTRICT foreign key."""
+    user = server.create_user("bjensen")
+    model.objects.create(user_id=user.id)
+
+    with pytest.raises(ConflictException, match="Another record refers"):
+        server.storage.delete(server.users, user.id)
+
+    assert UserRecord.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_user_a_foreign_key_of_the_database_refers_to_cannot_be_deleted():
+    """The database refuses the deletion, on PostgreSQL and SQLite when the operation commits."""
+    server = Server()
+    user = server.create_user("bjensen")
+    LogRecord.objects.create(user_id=user.id)
+
+    with pytest.raises(ConflictException, match="Another record refers"):
+        with server.storage.operation():
+            server.storage.delete(server.users, user.id)
+
+    assert UserRecord.objects.exists()
+
+
+def test_an_update_removing_an_entry_another_record_refers_to_is_a_conflict(server):
+    """An alias protects the email of the user."""
+    user = server.storage.create(
+        server.users,
+        server.user_model(
+            user_name="bjensen", emails=[{"value": "bjensen@example.com"}]
+        ),
+    )
+    AliasRecord.objects.create(email=EmailRecord.objects.get())
+    user.emails = None
+
+    with pytest.raises(ConflictException, match="Another record refers"):
+        server.storage.update(server.users, user)
+
+    assert EmailRecord.objects.exists()
+
+
+def test_an_integrity_error_without_a_cause_goes_up(server):
+    """Code of the project, rather than the database, may raise it."""
+    with pytest.raises(IntegrityError, match="refused by the project"):
+        with server.storage.operation():
+            raise IntegrityError("refused by the project")
+
+
+class Sqlstate(Exception):
+    sqlstate = "23503"
+
+
+class Pgcode(Exception):
+    pgcode = "23503"
+
+
+class SqliteError(Exception):
+    sqlite_errorname = "SQLITE_CONSTRAINT_FOREIGNKEY"
+
+
+@pytest.mark.parametrize(
+    "cause",
+    [
+        Sqlstate(),
+        Pgcode(),
+        SqliteError(),
+        *(ValueError(code) for code in (1216, 1217, 1451, 1452)),
+    ],
+    ids=["psycopg", "psycopg2", "sqlite", "1216", "1217", "1451", "1452"],
+)
+def test_a_write_a_foreign_key_refuses_is_a_conflict(server, monkeypatch, cause):
+    """The user links to a manager deleted in the meantime."""
+
+    def refuse(*args, **kwargs):
+        raise IntegrityError("FOREIGN KEY constraint failed") from cause
+
+    monkeypatch.setattr(UserRecord, "save", refuse)
+
+    with pytest.raises(ConflictException, match="Another record refers"):
+        server.create_user("bjensen")
+
+
+def test_another_integrity_error_of_a_deletion_goes_up(server, monkeypatch):
+    user = server.create_user("bjensen")
+
+    def refuse(*args, **kwargs):
+        raise IntegrityError("CHECK constraint failed") from ValueError("check")
+
+    monkeypatch.setattr(UserRecord, "delete", refuse)
+
+    with pytest.raises(IntegrityError):
+        server.storage.delete(server.users, user.id)
+
+
+@pytest.mark.parametrize(
+    "cause,error",
+    [(ValueError("check"), IntegrityError), (Sqlstate(), ConflictException)],
+    ids=["other", "foreign key"],
+)
+def test_an_integrity_error_leaving_an_operation_is_a_conflict_for_a_foreign_key(
+    server, cause, error
+):
+    with pytest.raises(error):
+        with server.storage.operation():
+            raise IntegrityError("constraint failed") from cause
 
 
 def test_a_link_to_an_unknown_resource_is_refused(server):

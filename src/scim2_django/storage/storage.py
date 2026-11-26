@@ -1,6 +1,8 @@
 import datetime
 import threading
+from collections.abc import Iterator
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from django.core.exceptions import ImproperlyConfigured
@@ -9,6 +11,9 @@ from django.db import IntegrityError
 from django.db import connections
 from django.db import transaction
 from django.db.models import F
+from django.db.models import ProtectedError
+from django.db.models import RestrictedError
+from scim2_models import ConflictException
 from scim2_models import InvalidValueException
 from scim2_models import NotFoundException
 from scim2_models import Path
@@ -48,6 +53,9 @@ from .query import _with_ids
 
 _DUPLICATE_ENTRY = 1062
 """The code of MariaDB for a value a unique index already holds."""
+
+_MISSING_REFERENCES = (1216, 1217, 1451, 1452)
+"""The codes of MariaDB for a foreign key refusing a change, with or without the details of the other table."""
 
 
 _LOADED = 500
@@ -147,13 +155,27 @@ class DjangoStorage(ScimStorage):
         self._bound = False
         self._lock = threading.Lock()
 
-    def operation(self) -> transaction.Atomic:
+    @contextmanager
+    def operation(self) -> Iterator[None]:
         """Run the operation in :func:`~django.db.transaction.atomic`.
 
         A failed operation of a bulk request is then rolled back alone
         (:rfc:`RFC 7644 §3.7 <7644#section-3.7>`).
+
+        On PostgreSQL and SQLite, the database checks the foreign keys Django
+        creates when the transaction commits. When this transaction is the
+        outermost one, a change a foreign key refuses raises a ``409``. Within
+        :setting:`ATOMIC_REQUESTS <DATABASE-ATOMIC_REQUESTS>` or a transaction
+        of the project, the error is raised when the project commits.
         """
-        return transaction.atomic(using=self.using)
+        try:
+            with transaction.atomic(using=self.using):
+                yield
+        except IntegrityError as error:
+            if _is_missing_reference(error):
+                raise _referenced() from error
+
+            raise
 
     def get(
         self,
@@ -305,16 +327,29 @@ class DjangoStorage(ScimStorage):
         *,
         expected_version: str | None = None,
     ) -> None:
-        """Delete a resource."""
-        mapping = self._mapping(resource_type)
-        with transaction.atomic(using=self.using):
-            record = self._load(resource_type, resource_id, locked=True)
-            if expected_version is not None:
-                stored = self._to_scim(resource_type, record)
-                self._check_version(stored, expected_version)
+        """Delete a resource.
 
-            self._count_write(mapping, record)
-            record.delete(using=self.using)
+        A deletion that a foreign key refuses raises a ``409``. On PostgreSQL
+        and SQLite, the database refuses it when the transaction commits, as
+        :meth:`operation` tells.
+        """
+        mapping = self._mapping(resource_type)
+        try:
+            with transaction.atomic(using=self.using):
+                record = self._load(resource_type, resource_id, locked=True)
+                if expected_version is not None:
+                    stored = self._to_scim(resource_type, record)
+                    self._check_version(stored, expected_version)
+
+                self._count_write(mapping, record)
+                record.delete(using=self.using)
+        except (ProtectedError, RestrictedError) as error:
+            raise _referenced() from error
+        except IntegrityError as error:
+            if _is_missing_reference(error):
+                raise _referenced() from error
+
+            raise
 
     def _mapping(self, resource_type: ResourceType) -> ResourceMapping:
         """Return the mapping of a resource type, once the Links of every mapping are bound.
@@ -526,10 +561,15 @@ class DjangoStorage(ScimStorage):
                 _write_collections(
                     mapping, resource, record, links, now, creating=stored is None
                 )
+        except (ProtectedError, RestrictedError) as error:
+            raise _referenced() from error
         except IntegrityError as error:
             self._check_uniqueness(mapping, resource, stored)
             if _is_duplicate(error):
                 raise UniquenessException from error
+
+            if _is_missing_reference(error):
+                raise _referenced() from error
 
             raise
 
@@ -656,11 +696,39 @@ class DjangoStorage(ScimStorage):
 def _is_duplicate(error: IntegrityError) -> bool:
     """Tell whether an integrity error comes from a unique index, by the code the driver of each database gives."""
     cause: Any = error.__cause__
+    if cause is None:
+        return False
+
     return bool(
-        getattr(cause, "sqlstate", None) == "23505"
+        _sqlstate(cause) == "23505"
         or getattr(cause, "sqlite_errorname", None)
         in ("SQLITE_CONSTRAINT_UNIQUE", "SQLITE_CONSTRAINT_PRIMARYKEY")
         or cause.args[:1] == (_DUPLICATE_ENTRY,)
+    )
+
+
+def _is_missing_reference(error: IntegrityError) -> bool:
+    """Tell whether an integrity error comes from a foreign key, by the code the driver of each database gives."""
+    cause: Any = error.__cause__
+    if cause is None:
+        return False
+
+    return bool(
+        _sqlstate(cause) == "23503"
+        or getattr(cause, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_FOREIGNKEY"
+        or cause.args[:1] in [(code,) for code in _MISSING_REFERENCES]
+    )
+
+
+def _sqlstate(cause: Any) -> str | None:
+    """Return the SQLSTATE of an error of PostgreSQL, as psycopg and psycopg2 give it."""
+    return getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)
+
+
+def _referenced() -> ConflictException:
+    """Return the error of a change that a foreign key refuses."""
+    return ConflictException(
+        detail="Another record refers to this resource, or it refers to a missing one"
     )
 
 

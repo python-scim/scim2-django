@@ -116,8 +116,7 @@ def test_a_user_is_written_and_read_back():
     assert user.user_name == "bjensen"
     assert user.name.given_name == "Barbara"
     assert user.active is True
-    assert user.password is None
-    assert record.password == "secret"
+    assert user.password == record.password == "secret"
     assert user.locale == "bjensen"
     assert [(e.value, e.type, e.primary) for e in user.emails] == [
         ("bjensen@example.com", "work", True),
@@ -225,8 +224,8 @@ def test_an_update_clears_the_missing_values():
     assert record.title is None
 
 
-def test_an_update_keeps_a_write_only_value_it_does_not_carry():
-    """A resource never carries its password back, so its absence changes nothing."""
+def test_an_update_without_a_write_only_value_removes_it():
+    """The server sends back the password it read, so a resource without it has no password."""
     users, _ = bound()
     record = UserRecord.objects.create(
         user_name="bjensen", password="secret", created=NOW, last_modified=NOW
@@ -234,7 +233,7 @@ def test_an_update_keeps_a_write_only_value_it_does_not_carry():
 
     record = save(users, users.model(user_name="bjensen"), record, creating=False)
 
-    assert record.password == "secret"
+    assert record.password is None
 
 
 def test_read_only_entries_cannot_change():
@@ -523,8 +522,8 @@ def test_a_new_resource_needs_a_write_only_value_its_field_cannot_do_without():
         _check_storable(mapping, mapping.model(), None)
 
 
-def test_a_value_never_returned_is_kept_by_a_replacement_without_it():
-    """Clients never read the secret, so they cannot send it back."""
+def test_a_replacement_without_a_value_never_returned_removes_it():
+    """The server sends back the secret it read, so a replacement without it removes it, which its field refuses."""
     mapping = ResourceMapping(
         User[Owned], Locker, {"id": "id", f"{OWNED}:secret": "code"}
     )
@@ -533,10 +532,8 @@ def test_a_value_never_returned_is_kept_by_a_replacement_without_it():
     stored = to_scim(mapping, locker)
     assert stored[Owned].secret == 7
 
-    _check_storable(mapping, mapping.model(), stored)
-    locker = save(mapping, mapping.model(), locker, creating=False)
-
-    assert locker.code == 7
+    with pytest.raises(MutabilityException, match=":secret' cannot be removed"):
+        _check_storable(mapping, mapping.model(), stored)
 
 
 def test_a_new_resource_may_leave_out_the_values_its_fields_get_by_themselves():

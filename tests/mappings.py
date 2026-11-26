@@ -1,12 +1,14 @@
+from django.db.models import Case
+from django.db.models import F
 from django.db.models import TextField
 from django.db.models import Value
+from django.db.models import When
 from django.db.models.functions import Cast
 from django.db.models.functions import Concat
 from scim2_models import EnterpriseUser
 from scim2_models import Group
 from scim2_models import User
 
-from scim2_django.storage import Attribute
 from scim2_django.storage import Link
 from scim2_django.storage import Many
 from scim2_django.storage import ResourceMapping
@@ -38,6 +40,14 @@ def hashed(value):
     return "!" if value is None else f"hash:{value}"
 
 
+def hashed_password():
+    """Return the mapping of a password stored as a fake hash, which the storage reads back."""
+    expression = Case(
+        When(password="!", then=None), default=F("password"), output_field=TextField()
+    )
+    return Transformed("password", expression=expression, to_field=hashed)
+
+
 def users_mapping(changes=None, version="version"):
     """Return a new mapping of the users, with some paths changed, or removed when None."""
     attributes = {
@@ -53,7 +63,7 @@ def users_mapping(changes=None, version="version"):
         "name.givenName": "given_name",
         "name.familyName": "family_name",
         "active": "active",
-        "password": Attribute("password", readable=False),
+        "password": "password",
         "emails": Many(
             "emails", {"value": "value", "type": "type", "primary": "primary"}
         ),

@@ -2,11 +2,10 @@ import pytest
 from scim2_server.testing import ScimStorageContract
 
 from scim2_django.storage import DjangoStorage
-from scim2_django.storage import Transformed
 
 from .mappings import ENTERPRISE
 from .mappings import groups_mapping
-from .mappings import hashed
+from .mappings import hashed_password
 from .mappings import prefixed
 from .mappings import users_mapping
 
@@ -69,7 +68,7 @@ class TestDjangoStorageWithTransformedFields(ScimStorageContract):
     def storage(self, provider):
         users = {
             "id": prefixed("u"),
-            "password": Transformed("password", to_field=hashed),
+            "password": hashed_password(),
         }
         mappings = {
             "User": users_mapping(users),

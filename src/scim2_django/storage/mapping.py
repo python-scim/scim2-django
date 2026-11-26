@@ -99,7 +99,6 @@ class _Storage(Enum):
 
     written = "written"
     read_only = "read only"
-    write_only = "write only"
     derived = "derived"
     ref = "ref"
     link_type = "link type"
@@ -107,24 +106,19 @@ class _Storage(Enum):
 
 
 class Attribute:
-    """A field holding a SCIM attribute that the storage only reads, or only writes.
+    """A field holding a SCIM attribute that the storage only reads.
+
+    The storage reads every attribute, a write-only one included, such as a
+    password: the server never returns it, but sends it back when a
+    replacement leaves it out.
 
     :param field: The name of the field holding the value.
-    :param readable: Whether the storage reads the attribute. When
-        :data:`False`, the attribute is write-only, such as a password: the
-        storage never returns it, nor filters or sorts on it.
-        :meth:`ResourceMapping.schemas` publishes it ``writeOnly`` and never
-        returned. An immutable attribute cannot be :data:`False`: the storage
-        reads it to keep it from changing.
     :param writable: Whether the storage writes the attribute. When
         :data:`False`, the attribute is read-only.
     """
 
-    def __init__(
-        self, field: str, *, readable: bool = True, writable: bool = True
-    ) -> None:
+    def __init__(self, field: str, *, writable: bool = True) -> None:
         self.field = field
-        self.readable = readable
         self.writable = writable
 
 
@@ -154,8 +148,12 @@ class Transformed:
     send through ``to_field``. The two must agree: ``to_field`` gives back the
     field value ``expression`` was computed from.
 
-    An attribute without ``expression`` is write-only, such as a password, so
-    it cannot be immutable. An attribute without ``to_field`` is read-only. ``id`` needs both: the
+    Without ``expression``, the storage reads the value of the field as it is.
+    Only an attribute hidden from clients allows it, write-only or never
+    returned, such as a password, and the field must hold a value of the type
+    of the attribute. A value sent back as the storage read it is not written
+    again, so that the hash of a password is not hashed again. An attribute
+    without ``to_field`` is read-only. ``id`` needs both: the
     storage finds a resource by its ``id`` through ``to_field``, so that the
     database uses the index of the field.
 
@@ -304,7 +302,6 @@ class _Column:
 
     binding: AttributeBinding
     key: str
-    readable: bool
     writable: bool
     field: "models.Field[Any, Any] | None" = None
     expression: Any = None
@@ -337,12 +334,13 @@ class _Column:
 
     @property
     def concealed(self) -> bool:
-        """Whether clients never read the value: the storage does not read it, or the server never returns it.
+        """Whether clients never read the value: the server never returns it, as for a write-only value.
 
-        Filters and sorts cannot compare it, and a replacement without it
-        keeps it.
+        Filters and sorts cannot compare it.
         """
-        return not self.readable or _never_returned(self.binding)
+        return _never_returned(self.binding) or Mutability.write_only in _mutabilities(
+            self.binding
+        )
 
     @property
     def empty_string(self) -> bool:
@@ -376,7 +374,7 @@ class _Column:
     def required(self) -> bool:
         """Whether a new record needs a value.
 
-        It does when the field can hold no value, and gets none from a default
+        It does when the field cannot be null, and gets no value from a default
         or from Django, as a date with auto_now does. A field of a related
         record needs none, as the related record may not exist.
         """
@@ -749,8 +747,7 @@ class ResourceMapping:
     def _restrict_simple(self, urn: str, attribute: Any) -> Any:
         """Return a simple attribute of a schema as the mapping stores it, or None when it stores nothing of it.
 
-        A single attribute whose field needs a value is required. An
-        attribute the storage never reads is write-only.
+        A single attribute whose field needs a value is required.
         """
         storage = self._storage(urn)
         if storage is None:
@@ -758,11 +755,6 @@ class ResourceMapping:
 
         if storage == _Storage.link_type:
             return attribute
-
-        if storage == _Storage.write_only:
-            return attribute.model_copy(
-                update={"mutability": Mutability.write_only, "returned": Returned.never}
-            )
 
         if storage == _Storage.written:
             if attribute.multi_valued or not self._needs_value(urn):
@@ -933,15 +925,6 @@ class ResourceMapping:
             if column.binding.urn.lower() == key
         )
 
-    def _concealed(self, urn: str) -> bool:
-        """Tell whether clients never read the attribute of a URN."""
-        key = urn.lower()
-        return any(
-            column.concealed
-            for column in self._columns.values()
-            if column.binding.urn.lower() == key
-        )
-
     def _required(self, urn: str) -> bool:
         """Tell whether a new record needs a value for the attribute of a URN."""
         return any(self._required_columns(urn))
@@ -1011,14 +994,15 @@ class ResourceMapping:
                 yield collection.type_column
 
     def _unique_columns(self) -> Iterator[_Column]:
-        """Yield the readable and written columns whose values no two resources share.
+        """Yield the written columns clients read, whose values no two resources share.
 
         A column never written, such as id, cannot get a value another
-        resource holds. A column of an entry is left out, as a resource holds
-        its values in a list.
+        resource holds. A column hidden from clients is left out, so that an
+        error tells nothing about the values of other resources. A column of an
+        entry is left out, as a resource holds its values in a list.
         """
         for column in self._columns.values():
-            if not (column.readable and column.writable) or column.in_entry:
+            if column.concealed or not column.writable or column.in_entry:
                 continue
 
             if column.binding.get_annotation(Uniqueness) in (
@@ -1226,26 +1210,17 @@ class ResourceMapping:
     def _check_read_and_written(
         self, path: str, binding: AttributeBinding, value: Any
     ) -> None:
-        """Refuse an attribute that clients could neither read nor write, or an immutable one the storage would not read."""
+        """Refuse an attribute that clients could neither read nor write, or one they read that the storage would read as it is stored."""
         mutabilities = _mutabilities(binding)
-        unread = (isinstance(value, Attribute) and not value.readable) or (
-            isinstance(value, Transformed) and value.expression is None
+        read = Mutability.write_only not in mutabilities and not _never_returned(
+            binding
         )
-        if (
-            unread
-            and Mutability.immutable in mutabilities
-            and Mutability.write_only not in mutabilities
-        ):
+        if read and isinstance(value, Transformed) and value.expression is None:
             raise ValueError(
-                f"{path!r} is immutable, so the storage reads it to keep it "
-                "from changing"
+                f"Clients read {path!r}, so its Transformed needs an expression, "
+                "unless its schema makes it write-only"
             )
 
-        read = (
-            Mutability.write_only not in mutabilities
-            and not _never_returned(binding)
-            and not unread
-        )
         written = Mutability.read_only not in mutabilities and not (
             isinstance(value, Computed)
             or (isinstance(value, Attribute) and not value.writable)
@@ -1478,21 +1453,19 @@ class ResourceMapping:
         binding: AttributeBinding,
         value: Any,
     ) -> Generator[checks.CheckMessage, None, _Column | None]:
-        """Build the column of an attribute, and decide whether it is read and written.
+        """Build the column of an attribute, and decide whether it is written.
 
-        A write-only attribute is never read. A read-only attribute, a
-        generated field and a computed expression are never written.
+        A read-only attribute, a generated field and a computed expression are
+        never written.
         """
-        mutabilities = _mutabilities(binding)
-        readable = Mutability.write_only not in mutabilities
-        writable = Mutability.read_only not in mutabilities
+        writable = Mutability.read_only not in _mutabilities(binding)
         if isinstance(value, Computed):
             alias = _alias(binding)
             output = yield from self._output_field(path, alias, value.expression)
             if output is None:
                 return None
 
-            computed = _Column(binding, alias, True, False, expression=value.expression)
+            computed = _Column(binding, alias, False, expression=value.expression)
             if computed.is_string and not _holds_text(output):
                 yield self._not_text(path, "its expression")
                 return None
@@ -1500,11 +1473,7 @@ class ResourceMapping:
             return computed
 
         if isinstance(value, Transformed):
-            return (
-                yield from self._transformed(
-                    model, path, binding, value, readable, writable
-                )
-            )
+            return (yield from self._transformed(model, path, binding, value, writable))
 
         attribute = value if isinstance(value, Attribute) else Attribute(value)
         column = yield from self._field_column(
@@ -1512,7 +1481,6 @@ class ResourceMapping:
             path,
             binding,
             attribute.field,
-            attribute.readable and readable,
             attribute.writable and writable,
         )
         if column is None:
@@ -1526,7 +1494,7 @@ class ResourceMapping:
             yield self._not_text(path, repr(attribute.field))
             return None
 
-        if column.readable and _converts(field):
+        if not column.concealed and _converts(field):
             yield checks.Warning(
                 f"{path!r} is mapped to {attribute.field!r}, whose field converts "
                 "the values it reads: filters and sorts compare the stored values, "
@@ -1543,7 +1511,6 @@ class ResourceMapping:
         path: str,
         binding: AttributeBinding,
         name: str,
-        readable: bool,
         writable: bool,
     ) -> Generator[checks.CheckMessage, None, _Column | None]:
         """Build the column of a field, of the record or of a record related by a reverse one-to-one relation.
@@ -1570,9 +1537,11 @@ class ResourceMapping:
             )
             return None
 
-        if field.generated and not readable:
+        if field.generated and (
+            Mutability.write_only in _mutabilities(binding) or _never_returned(binding)
+        ):
             yield self._error(
-                f"{path!r} is never read, and {name!r} is a generated field, "
+                f"Clients never read {path!r}, and {name!r} is a generated field, "
                 "which the storage never writes",
                 "scim2_django.E011",
             )
@@ -1581,7 +1550,6 @@ class ResourceMapping:
         return _Column(
             binding,
             name,
-            readable,
             writable and not field.generated,
             field,
             relation=relation,
@@ -1593,16 +1561,17 @@ class ResourceMapping:
         path: str,
         binding: AttributeBinding,
         transformed: Transformed,
-        readable: bool,
         writable: bool,
     ) -> Generator[checks.CheckMessage, None, _Column | None]:
-        """Build the column of a transformed field, read through its expression and written through to_field."""
+        """Build the column of a transformed field, read through its expression and written through to_field.
+
+        Without expression, the field is read as it is stored.
+        """
         column = yield from self._field_column(
             model,
             path,
             binding,
             transformed.field,
-            readable and transformed.expression is not None,
             writable and transformed.to_field is not None,
         )
         if column is None:
@@ -1610,7 +1579,12 @@ class ResourceMapping:
 
         column.path = transformed.field
         column.to_field = transformed.to_field
-        if not column.readable:
+        field: Any = column.field
+        if transformed.expression is None:
+            if column.is_string and not _holds_text(field):
+                yield self._not_text(path, repr(transformed.field))
+                return None
+
             return column
 
         alias = _alias(binding)
@@ -1895,7 +1869,7 @@ class ResourceMapping:
             )
             result.constants[name] = (
                 constant,
-                _Column(sub_binding, name, True, False, expression=expression),
+                _Column(sub_binding, name, False, expression=expression),
             )
 
         return result
@@ -1976,7 +1950,6 @@ class ResourceMapping:
                 collection.type_column = _Column(
                     self._resolve(f"{path}.type"),
                     "type",
-                    True,
                     False,
                     expression=models.Value(link.type),
                 )
@@ -2010,11 +1983,8 @@ def _mutabilities(binding: AttributeBinding) -> set[Mutability | None]:
 
 
 def _column_storage(column: _Column) -> _Storage:
-    """Return how a column stores its attribute: read and written, or only one of them."""
-    if not column.writable:
-        return _Storage.read_only
-
-    return _Storage.written if column.readable else _Storage.write_only
+    """Return how a column stores its attribute: read and written, or only read."""
+    return _Storage.written if column.writable else _Storage.read_only
 
 
 def _never_returned(binding: AttributeBinding) -> bool:

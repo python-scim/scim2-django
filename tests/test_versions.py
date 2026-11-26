@@ -133,14 +133,13 @@ def test_a_write_on_the_current_version_is_stored(server):
 
 
 def test_a_new_password_changes_the_version():
-    """The password is never read, yet a client writing it again holds an outdated version."""
+    """Clients never read the password, yet a client writing it again holds an outdated version."""
     server = Server({"meta.created": None, "meta.lastModified": None})
     user = server.create_user("bjensen")
     user.password = "t1meMa$heen"
 
     updated = server.storage.update(server.users, user)
 
-    assert updated.password is None
     assert updated.meta.version != user.meta.version
 
 

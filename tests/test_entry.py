@@ -9,7 +9,6 @@ from scim2_models import ScimFilter
 from scim2_models import SearchRequest
 from scim2_models import User
 
-from scim2_django.storage import Attribute
 from scim2_django.storage import Computed
 from scim2_django.storage import Entry
 from scim2_django.storage import ResourceMapping
@@ -254,11 +253,10 @@ def test_an_entry_gives_existing_sub_attributes_only():
     ("entry", "error"),
     [
         (Entry({"value": "nope"}), "scim2_django.E001"),
-        (Entry({"value": Attribute("email", readable=False)}), "scim2_django.E007"),
         (Entry({"value": "email", "primary": "version"}), "scim2_django.E007"),
         (Entry({"value": "email", "display": "lower_name"}), "scim2_django.E007"),
     ],
-    ids=["unknown field", "write-only value", "field without null", "read-only value"],
+    ids=["unknown field", "field without null", "read-only value"],
 )
 def test_the_fields_of_an_entry_are_checked(entry, error):
     assert [message.id for message in users_mapping({"emails": entry}).check()] == [

@@ -11,21 +11,27 @@ Added
   attribute holding such a sub-attribute.
 - The warning ``scim2_django.W002`` reports a field of the resource model that needs a value, and
   that the storage never writes. Creating a resource then raises a database error.
-- The check ``scim2_django.E011`` refuses an attribute that the storage never reads, mapped to a
-  generated field.
+- The check ``scim2_django.E011`` refuses an attribute that clients never read, write-only or never
+  returned, mapped to a generated field.
 
 Changed
 ^^^^^^^
-- An attribute mapped with ``readable=False``, or to a
-  :class:`~scim2_django.storage.Transformed` without ``expression``, is published ``writeOnly``
-  and never returned.
-- An attribute that the server never returns, such as a write-only one, is published optional,
-  even when its schema requires it. It cannot be filtered nor sorted on. A replacement without
-  its value keeps it, so a PATCH cannot remove it. The check ``scim2_django.E007`` refuses it in
-  the entries of a :class:`~scim2_django.storage.Many` or an
-  :class:`~scim2_django.storage.Entry`. A link does not display it.
-- A mapping refuses an attribute that clients could neither read nor write, and an immutable
-  attribute that the storage would not read.
+- Needs scim2-server 0.8.9 and scim2-models 0.12.7 or later.
+- The storage reads the attributes hidden from clients, write-only or never returned, and the
+  server never returns them. A PUT without such a value keeps it, and a PATCH can remove it. A
+  value sent back as the storage read it is not written again, so the hash of a password is not
+  hashed again. A hidden attribute is published
+  optional, even when its schema requires it. It cannot be filtered nor sorted on, and the storage
+  does not check its uniqueness. The check ``scim2_django.E007`` refuses it in the entries of a
+  :class:`~scim2_django.storage.Many` or an :class:`~scim2_django.storage.Entry`. A link does not
+  display it.
+- :class:`~scim2_django.storage.Attribute` no longer takes ``readable``: the storage reads every
+  attribute. A :class:`~scim2_django.storage.Transformed` without ``expression`` reads its field as
+  it is stored. A mapping refuses it for an attribute that clients read: give it an
+  ``expression``, or make the attribute write-only in its schema.
+- The ``password`` of :func:`~scim2_django.auth.user_mapping` is read as its hash, and as no value
+  for an unusable password. Removing it makes it unusable.
+- A mapping refuses an attribute that clients could neither read nor write.
 - The check ``scim2_django.E003`` refuses a foreign key without null for a required
   :class:`~scim2_django.storage.Link` of an optional extension. A resource without the extension
   raised a database error.

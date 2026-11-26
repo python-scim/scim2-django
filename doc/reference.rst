@@ -107,12 +107,12 @@ The checks report the following errors and warnings:
        leaves out, so the storage cannot create its records. Or the related model holds a date,
        so each write creates its records, and has a mapped field without null nor default.
    * - ``scim2_django.E011``
-     - An attribute the storage never reads, such as a write-only one, is mapped to a generated
-       field, which the storage never writes.
+     - An attribute that clients never read, write-only or never returned, is mapped to a
+       generated field, which the storage never writes.
    * - ``scim2_django.W001``
-     - A readable string attribute is mapped to a text field that converts the values it reads,
-       such as a field decrypting them. Filters and sorts compare the stored values, not the
-       values clients read.
+     - A string attribute that clients read is mapped to a text field that converts the values it
+       reads, such as a field decrypting them. Filters and sorts compare the stored values, not
+       the values clients read.
    * - ``scim2_django.W002``
      - A field of the resource model has neither null nor a default, and the storage never
        writes it. Creating a resource then fails. Map the field, or give it a default. A text

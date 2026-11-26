@@ -21,6 +21,7 @@ from scim2_models import Mutability
 from scim2_models import Required
 from scim2_models import Resource
 from scim2_models import Returned
+from scim2_models import Uniqueness
 from scim2_models import User
 
 from scim2_django.storage import Attribute
@@ -101,6 +102,15 @@ class Owned(Extension):
 
 
 OWNED = "urn:example:params:scim:schemas:extension:owned:2.0:User"
+SEALED = "urn:example:params:scim:schemas:extension:sealed:2.0:User"
+
+
+class Sealed(Extension):
+    __schema__ = URN(SEALED)
+
+    serial: Annotated[str | None, Mutability.write_only, Uniqueness.server] = None
+
+
 OwnedUser = User[Annotated[Owned, Required.true]]
 
 
@@ -108,6 +118,7 @@ class Tagged(Extension):
     __schema__ = URN(TAGGED)
 
     tags: list[str] | None = None
+    codes: Annotated[list[str] | None, Mutability.write_only] = None
     badge: Badge | None = None
 
 
@@ -374,7 +385,7 @@ def test_a_converting_field_holding_a_string_is_reported():
     assert not warning.is_serious()
 
 
-def test_a_converting_field_never_read_is_not_reported():
+def test_a_converting_field_hidden_from_clients_is_not_reported():
     """A write-only attribute is never filtered nor sorted."""
     mapping = person_mapping(password="code")
 
@@ -481,14 +492,10 @@ def test_a_field_that_needs_a_value_is_published_required():
         pytest.param(lambda: person_mapping(active="enabled"), id="default"),
         pytest.param(lambda: users_mapping(), id="null"),
         pytest.param(lambda: users_mapping({"active": "card__number"}), id="related"),
-        pytest.param(
-            lambda: applicant_mapping(active=Attribute("enabled", readable=False)),
-            id="unread",
-        ),
     ],
 )
 def test_a_field_that_can_do_without_a_value_is_published_optional(mapping):
-    """A default, a null, a related record that may not exist, or a value clients never read back."""
+    """A default, a null, or a related record that may not exist."""
     (user, *_) = mapping().schemas()
 
     assert published(user, "active").required == Required.false
@@ -499,9 +506,9 @@ def test_a_field_that_can_do_without_a_value_is_published_optional(mapping):
     [
         ("pin", "code"),
         ("secret", "code"),
-        ("secret", Attribute("code", readable=False)),
+        ("secret", Transformed("code", to_field=int)),
     ],
-    ids=["write-only", "never returned", "never read"],
+    ids=["write-only", "never returned", "read as stored"],
 )
 def test_a_value_never_returned_is_published_optional(name, value):
     """Clients replacing a locker cannot send back a code they never read."""
@@ -630,40 +637,45 @@ def test_fields_filled_without_the_storage_are_accepted():
 
 
 @pytest.mark.parametrize(
-    "value",
-    [Attribute("title", readable=False), Transformed("title", to_field=str)],
-    ids=["unreadable", "transformed"],
+    "path", ["badge", "card.value"], ids=["simple", "sub-attribute"]
 )
-def test_an_attribute_the_storage_never_reads_is_published_write_only(value):
-    """Clients never get the title back, so the schema says so."""
-    (user, _) = users_mapping({"title": value}).schemas()
-
-    title = published(user, "title")
-    assert (title.mutability, title.returned) == (Mutability.write_only, Returned.never)
-
-
-@pytest.mark.parametrize(
-    "path,value",
-    [
-        ("badge", Attribute("user_name", readable=False)),
-        ("badge", Transformed("user_name", to_field=str)),
-        ("card.value", Attribute("user_name", readable=False)),
-    ],
-    ids=["unreadable", "transformed", "sub-attribute"],
-)
-def test_an_immutable_attribute_the_storage_never_reads_is_refused(path, value):
-    """Without the stored value, nothing would keep clients from changing it."""
-    with pytest.raises(ValueError, match="is immutable, so the storage reads it"):
+def test_a_transformed_value_clients_read_needs_an_expression(path):
+    """Clients would read the badge as it is stored."""
+    with pytest.raises(ValueError, match="its Transformed needs an expression"):
         ResourceMapping(
             User[Owned],
             Person,
-            REQUIRED | {f"{OWNED}:{path}": value},
+            REQUIRED | {f"{OWNED}:{path}": Transformed("user_name", to_field=str)},
             version="version",
         )
 
 
-def test_a_write_only_value_of_an_immutable_attribute_is_never_read():
-    """Write-only wins: the pin of the card is set, never read back."""
+def test_a_hidden_value_is_read_as_it_is_stored():
+    """The server sends the secret back as the storage read it."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Locker,
+        {"id": "id", f"{OWNED}:secret": Transformed("code", to_field=int)},
+    )
+    mapping.schemas()
+
+    column = mapping._column(f"{OWNED}:secret")
+    assert (column.key, column.expression) == ("code", None)
+
+
+def test_a_hidden_value_read_as_stored_needs_a_field_holding_its_type():
+    """The seal is a string, which the integer code cannot hold."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Locker,
+        {"id": "id", f"{OWNED}:seal": Transformed("code", to_field=int)},
+    )
+
+    assert error_ids(mapping) == ["scim2_django.E008"]
+
+
+def test_a_write_only_value_of_an_immutable_attribute_stays_write_only():
+    """Write-only wins: clients can change the pin of the card."""
     mapping = ResourceMapping(
         User[Owned],
         Person,
@@ -728,25 +740,12 @@ def test_an_attribute_never_returned_is_published_optional_even_when_required(
     assert published(owned, name).required == Required.false
 
 
-def test_a_required_attribute_the_storage_never_reads_is_published_optional():
-    """The user name is required by its schema, but clients never read it back."""
-    (user, _) = users_mapping(
-        {"userName": Attribute("user_name", readable=False)}
-    ).schemas()
-
-    user_name = published(user, "userName")
-    assert (user_name.mutability, user_name.required) == (
-        Mutability.write_only,
-        Required.false,
-    )
-
-
 def test_a_required_complex_attribute_holding_values_never_read_is_published_optional():
     """Nothing of the owner is returned, so clients cannot send it back."""
     mapping = ResourceMapping(
         User[Owned],
         Person,
-        REQUIRED | {f"{OWNED}:owner.value": Attribute("user_name", readable=False)},
+        REQUIRED | {f"{OWNED}:owner.code": "user_name"},
         version="version",
     )
     (_, owned) = mapping.schemas()
@@ -760,7 +759,7 @@ def test_a_complex_attribute_holding_values_never_read_is_published_write_only()
     mapping = ResourceMapping(
         User[Owned],
         Person,
-        REQUIRED | {f"{OWNED}:sponsor.value": Attribute("user_name", readable=False)},
+        REQUIRED | {f"{OWNED}:sponsor.code": "user_name"},
         version="version",
     )
     (_, owned) = mapping.schemas()
@@ -775,18 +774,6 @@ def test_a_complex_attribute_holding_values_never_read_is_published_write_only()
 @pytest.mark.parametrize(
     "mapping",
     [
-        pytest.param(
-            lambda: users_mapping(
-                {"title": Attribute("title", readable=False, writable=False)}
-            ),
-            id="unreadable and unwritable",
-        ),
-        pytest.param(
-            lambda: person_mapping(
-                **{"meta.resourceType": Attribute("user_name", readable=False)}
-            ),
-            id="read-only and unreadable",
-        ),
         pytest.param(
             lambda: locker_mapping(Attribute("code", writable=False)),
             id="write-only and unwritable",
@@ -812,11 +799,32 @@ def test_an_attribute_neither_read_nor_written_is_refused(mapping):
         mapping()
 
 
-def test_a_write_only_attribute_is_not_mapped_to_a_generated_field():
-    """The storage would neither read nor write the pin."""
-    (error,) = locker_mapping("double").check()
+@pytest.mark.parametrize(
+    "name", ["pin", "secret"], ids=["write-only", "never returned"]
+)
+def test_an_attribute_clients_never_read_is_not_mapped_to_a_generated_field(name):
+    """Clients could neither read nor write it."""
+    mapping = ResourceMapping(
+        User[Owned], Locker, {"id": "id", f"{OWNED}:{name}": "double"}
+    )
+
+    (error,) = mapping.check()
 
     assert error.id == "scim2_django.E011"
+
+
+def test_a_unique_value_hidden_from_clients_is_not_checked_by_the_storage():
+    """A refusal would tell a client which serials other users hold."""
+    mapping = ResourceMapping(
+        User[Sealed],
+        UserRecord,
+        {"id": "id", "userName": "user_name", f"{SEALED}:serial": "serial"},
+    )
+    mapping.schemas()
+
+    assert [column.binding.urn for column in mapping._unique_columns()] == [
+        f"{User.__schema__}:userName"
+    ]
 
 
 def test_a_mapping_with_another_error_is_not_told_about_its_unwritten_fields():
@@ -1017,9 +1025,9 @@ def test_two_paths_to_the_same_attribute_are_refused():
     "value",
     [
         Computed(Value("2026-01-01")),
-        Attribute("created", readable=False),
+        Attribute("created", writable=False),
     ],
-    ids=["computed", "write-only"],
+    ids=["computed", "read-only"],
 )
 def test_the_dates_are_mapped_to_the_name_of_a_field(value):
     """The storage writes the dates and reads them back."""
@@ -1140,12 +1148,13 @@ def test_a_binary_value_is_held_by_a_binary_field():
     assert mapping.check() == []
 
 
-def test_a_write_only_attribute_of_the_schema_is_never_read():
-    """The password is write-only in the schema, so mapping it by its name is enough to keep it from being read."""
+def test_a_write_only_attribute_of_the_schema_is_read_but_hidden_from_clients():
+    """The server sends the password back when a replacement leaves it out, but never returns it."""
     mapping = users_mapping({"password": "password"})
     mapping.schemas()
 
-    assert not mapping._column("password").readable
+    column = mapping._column("password")
+    assert column.concealed
 
 
 def test_the_checks_wait_for_the_models(monkeypatch):
@@ -1234,11 +1243,9 @@ def test_the_type_of_a_link_is_found_in_each_link():
 @pytest.mark.parametrize(
     "emails",
     [
-        Many("emails", {"value": "value", "type": Attribute("type", readable=False)}),
-        Many("emails", {"value": Attribute("value", readable=False)}),
         Many("emails", {"value": "value", "type": Attribute("type", writable=False)}),
     ],
-    ids=["write-only next to readable", "write-only", "read-only next to written"],
+    ids=["read-only next to written"],
 )
 def test_entries_that_a_write_would_partly_lose_are_refused(emails):
     """A write replaces the entries, so a value the client never sends back would be lost."""
@@ -1249,7 +1256,14 @@ def test_entries_that_a_write_would_partly_lose_are_refused(emails):
 
 def test_a_list_of_write_only_strings_is_refused():
     """A PATCH adding a tag would replace the tags clients never read back."""
-    (error,) = tagged_mapping(Attribute("value", readable=False)).check()
+    mapping = ResourceMapping(
+        User[Tagged],
+        TaggedUser,
+        REQUIRED | {"userName": "user_name", f"{TAGGED}:codes": Many("tags", "value")},
+        version="version",
+    )
+
+    (error,) = mapping.check()
 
     assert error.id == "scim2_django.E007"
 

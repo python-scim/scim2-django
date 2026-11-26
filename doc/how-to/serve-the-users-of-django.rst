@@ -32,7 +32,8 @@ The mapping of the users holds the attributes the user model has fields for: ``u
 ``name.givenName``, ``name.familyName``, one ``work`` email address, ``active``, ``password``,
 ``groups`` and ``meta.created``. A password follows the validators of
 :setting:`AUTH_PASSWORD_VALIDATORS`. A user created without password, or with an empty one, gets
-an unusable one, as with :meth:`~django.contrib.auth.models.UserManager.create_user`. The mapping of the groups holds
+an unusable one, as with :meth:`~django.contrib.auth.models.UserManager.create_user`, and so
+does a user whose password is removed. The mapping of the groups holds
 ``displayName`` and ``members``.
 
 The resources have no ``meta.lastModified``. Their ``meta.version`` is a hash of the resource:

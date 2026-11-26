@@ -236,6 +236,46 @@ def test_a_password_is_write_only():
     assert password.mutability == Mutability.write_only
 
 
+def test_the_storage_reads_the_hash_of_a_password(server):
+    """The server sends the hash back when a replacement leaves the password out."""
+    user = server.create_user(userName="bjensen", password="t1meMa$heen")
+
+    user = server.storage.get(server.users, user.id)
+
+    assert user.password == AuthUser.objects.get().password
+
+
+def test_an_unusable_password_is_read_as_no_password(server):
+    AuthUser.objects.create(pk=7, username="bjensen", password=make_password(None))
+
+    assert server.storage.get(server.users, "u7").password is None
+
+
+def test_a_user_sent_back_as_read_keeps_its_password(server):
+    user = server.create_user(userName="bjensen", password="t1meMa$heen")
+    user = server.storage.get(server.users, user.id)
+    user.active = False
+
+    server.storage.update(server.users, user)
+
+    assert AuthUser.objects.get().check_password("t1meMa$heen")
+
+
+@pytest.mark.parametrize("password", ["t1meMa$heen", ""], ids=["usable", "empty"])
+def test_removing_a_password_makes_it_unusable(server, password):
+    """A user created outside SCIM may hold an empty password."""
+    AuthUser.objects.create(
+        pk=7, username="bjensen", password=make_password(password) if password else ""
+    )
+    user = server.storage.get(server.users, "u7")
+    user.password = None
+
+    updated = server.storage.update(server.users, user)
+
+    assert updated.password is None
+    assert not AuthUser.objects.get().has_usable_password()
+
+
 def test_a_password_can_be_made_unusable_whatever_the_client_sends():
     """A project whose users log in through the identity provider only ignores the passwords."""
     unusable = Transformed("password", to_field=lambda value: make_password(None))

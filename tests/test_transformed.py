@@ -20,6 +20,7 @@ from scim2_django.storage import Transformed
 from .mappings import ENTERPRISE
 from .mappings import groups_mapping
 from .mappings import hashed
+from .mappings import hashed_password
 from .mappings import prefixed
 from .mappings import users_mapping
 from .models import GroupRecord
@@ -187,13 +188,13 @@ def test_an_update_keeps_the_unique_values_of_the_resource(server):
     assert updated.display_name == "Babs"
 
 
-def test_a_password_is_written_through_to_field(server):
+def test_a_password_is_written_through_to_field_and_read_as_stored(server):
+    """Without expression, the storage reads the hash, which the server never returns."""
     user = server.storage.create(
         server.users, server.user_model(user_name="bjensen", password="t1meMa$heen")
     )
 
-    assert user.password is None
-    assert UserRecord.objects.get().password == "hash:t1meMa$heen"
+    assert user.password == UserRecord.objects.get().password == "hash:t1meMa$heen"
 
 
 def test_a_new_resource_without_value_gets_what_to_field_gives_for_none(server):
@@ -206,6 +207,21 @@ def test_an_update_without_password_keeps_it(server):
     user = server.storage.create(
         server.users, server.user_model(user_name="bjensen", password="secret")
     )
+    user.display_name = "Babs"
+
+    server.storage.update(server.users, user)
+
+    assert UserRecord.objects.get().password == "hash:secret"
+
+
+def test_a_hash_read_back_unchanged_is_not_hashed_again():
+    """The server sends back the hash it read when a replacement leaves the password out."""
+    server = Server(mappings={"User": users_mapping({"password": hashed_password()})})
+    user = server.storage.create(
+        server.users, server.user_model(user_name="bjensen", password="secret")
+    )
+    user = server.storage.get(server.users, user.id)
+    assert user.password == "hash:secret"
     user.display_name = "Babs"
 
     server.storage.update(server.users, user)
@@ -261,6 +277,30 @@ def test_an_update_removing_a_value_writes_what_to_field_gives_for_none(server):
 
     assert updated.nick_name is None
     assert UserRecord.objects.get().nick_name is None
+
+
+def test_a_new_record_beside_the_resource_gets_what_to_field_gives_for_none():
+    """The record beside the user did not exist, so its external id gets a value."""
+    external_id = Transformed(
+        "scim__external_id",
+        expression=F("scim__external_id"),
+        to_field=lambda value: value or "none",
+    )
+    server = Server(
+        mappings={
+            "User": users_mapping(
+                {"externalId": external_id, f"{ENTERPRISE}:division": "scim__division"}
+            )
+        }
+    )
+    user = server.create_user("bjensen")
+    assert not UserScim.objects.exists()
+
+    data = user.model_dump()
+    data[ENTERPRISE] = {"division": "R&D"}
+    server.storage.update(server.users, type(user).model_validate(data))
+
+    assert UserScim.objects.get().external_id == "none"
 
 
 def test_a_field_beside_the_resource_is_transformed():
@@ -327,8 +367,14 @@ def test_an_entry_cannot_be_transformed():
 @pytest.mark.parametrize(
     ("value", "error"),
     [
-        (Transformed("nope", to_field=str), "scim2_django.E001"),
-        (Transformed("manager", to_field=str), "scim2_django.E002"),
+        (
+            Transformed("nope", expression=F("title"), to_field=str),
+            "scim2_django.E001",
+        ),
+        (
+            Transformed("manager", expression=F("title"), to_field=str),
+            "scim2_django.E002",
+        ),
         (
             Transformed("title", expression=F("badge_number"), to_field=str),
             "scim2_django.E008",

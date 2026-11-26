@@ -19,21 +19,32 @@ from scim2_models import Extension
 from scim2_models import Group
 from scim2_models import Mutability
 from scim2_models import Required
+from scim2_models import Resource
+from scim2_models import Returned
+from scim2_models import Uniqueness
 from scim2_models import User
 
 from scim2_django.storage import Attribute
 from scim2_django.storage import Computed
+from scim2_django.storage import Entry
 from scim2_django.storage import Link
 from scim2_django.storage import Many
 from scim2_django.storage import ResourceMapping
+from scim2_django.storage import Transformed
 from scim2_django.storage.mapping import check_mappings
 
 from .mappings import ENTERPRISE
 from .mappings import groups_mapping
 from .mappings import users_mapping
+from .models import Applicant
+from .models import Coded
+from .models import Contractor
+from .models import Counted
 from .models import GroupRecord
+from .models import Locker
 from .models import Person
 from .models import TaggedUser
+from .models import Ticket
 from .models import UserRecord
 
 TAGGED = "urn:example:params:scim:schemas:extension:tagged:2.0:User"
@@ -46,6 +57,30 @@ class Badge(ComplexAttribute):
 class Owner(ComplexAttribute):
     value: str | None = None
     display: Annotated[str | None, Mutability.read_only] = None
+    code: Annotated[str | None, Returned.never] = None
+    pin: Annotated[str | None, Mutability.write_only] = None
+
+
+class Key(ComplexAttribute):
+    value: str | None = None
+    hint: Annotated[str | None, Returned.never] = None
+
+
+class Visitor(Resource):
+    __schema__ = URN("urn:example:params:scim:schemas:core:2.0:Visitor")
+
+    display_name: Annotated[str | None, Returned.never] = None
+
+
+class Device(Resource):
+    __schema__ = URN("urn:example:params:scim:schemas:core:2.0:Device")
+
+    enabled: bool | None = None
+    owner: Annotated[Owner | None, Required.true] = None
+
+
+class Shift(ComplexAttribute):
+    open: bool | None = None
 
 
 class Owned(Extension):
@@ -55,15 +90,35 @@ class Owned(Extension):
     sponsor: Owner | None = None
     since: datetime.datetime | None = None
     verified: bool | None = None
+    shift: Shift | None = None
+    pin: Annotated[int | None, Mutability.write_only] = None
+    secret: Annotated[int | None, Returned.never] = None
+    badge: Annotated[str | None, Mutability.immutable] = None
+    card: Annotated[Owner | None, Mutability.immutable] = None
+    seal: Annotated[str | None, Mutability.immutable, Returned.never] = None
+    token: Annotated[int | None, Mutability.write_only, Required.true] = None
+    serial: Annotated[int | None, Returned.never, Required.true] = None
+    keys: list[Key] | None = None
 
 
 OWNED = "urn:example:params:scim:schemas:extension:owned:2.0:User"
+SEALED = "urn:example:params:scim:schemas:extension:sealed:2.0:User"
+
+
+class Sealed(Extension):
+    __schema__ = URN(SEALED)
+
+    serial: Annotated[str | None, Mutability.write_only, Uniqueness.server] = None
+
+
+OwnedUser = User[Annotated[Owned, Required.true]]
 
 
 class Tagged(Extension):
     __schema__ = URN(TAGGED)
 
     tags: list[str] | None = None
+    codes: Annotated[list[str] | None, Mutability.write_only] = None
     badge: Badge | None = None
 
 
@@ -106,7 +161,9 @@ def test_a_mapping_can_leave_out_the_dates(dates):
     """The resources then have no such date, and the check accepts the mapping."""
     attributes = {key: value for key, value in REQUIRED.items() if key not in dates}
 
-    mapping = ResourceMapping(User, Person, attributes, version="version")
+    mapping = ResourceMapping(
+        User, UserRecord, attributes | {"userName": "user_name"}, version="version"
+    )
 
     assert error_ids(mapping) == []
     assert mapping._created is None
@@ -328,9 +385,9 @@ def test_a_converting_field_holding_a_string_is_reported():
     assert not warning.is_serious()
 
 
-def test_a_converting_field_never_read_is_not_reported():
+def test_a_converting_field_hidden_from_clients_is_not_reported():
     """A write-only attribute is never filtered nor sorted."""
-    mapping = person_mapping(title=Attribute("code", readable=False))
+    mapping = person_mapping(password="code")
 
     assert mapping.check() == []
 
@@ -397,6 +454,384 @@ def test_the_schemas_hold_the_mapped_attributes_only():
     (name,) = [a for a in user.attributes if a.name == "name"]
     assert [sub.name for sub in name.sub_attributes] == ["familyName", "givenName"]
     assert [a.name for a in enterprise.attributes] == ["employeeNumber", "manager"]
+
+
+def applicant_mapping(**attributes):
+    """Return a mapping of the applicants, whose fields need a boolean and an owner."""
+    attributes = {
+        "active": "enabled",
+        f"{OWNED}:owner": Link("mentor", "User"),
+    } | attributes
+    return ResourceMapping(
+        OwnedUser,
+        Applicant,
+        REQUIRED | {path: value for path, value in attributes.items() if value},
+        version="version",
+    )
+
+
+def locker_mapping(pin="code"):
+    return ResourceMapping(User[Owned], Locker, {"id": "id", f"{OWNED}:pin": pin})
+
+
+def published(schema, name):
+    (attribute,) = [a for a in schema.attributes if a.name == name]
+    return attribute
+
+
+def test_a_field_that_needs_a_value_is_published_required():
+    """An applicant cannot be created without saying whether it is enabled."""
+    (user, _) = applicant_mapping().schemas()
+
+    assert published(user, "active").required == Required.true
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        pytest.param(lambda: person_mapping(active="enabled"), id="default"),
+        pytest.param(lambda: users_mapping(), id="null"),
+        pytest.param(lambda: users_mapping({"active": "card__number"}), id="related"),
+    ],
+)
+def test_a_field_that_can_do_without_a_value_is_published_optional(mapping):
+    """A default, a null, or a related record that may not exist."""
+    (user, *_) = mapping().schemas()
+
+    assert published(user, "active").required == Required.false
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("pin", "code"),
+        ("secret", "code"),
+        ("secret", Transformed("code", to_field=int)),
+    ],
+    ids=["write-only", "never returned", "read as stored"],
+)
+def test_a_value_never_returned_is_published_optional(name, value):
+    """Clients replacing a locker cannot send back a code they never read."""
+    mapping = ResourceMapping(
+        User[Owned], Locker, {"id": "id", f"{OWNED}:{name}": value}
+    )
+    (_, owned) = mapping.schemas()
+
+    assert published(owned, name).required == Required.false
+
+
+def test_a_text_field_without_null_is_published_optional():
+    """Django stores an empty string for no value."""
+    (user, _) = users_mapping().schemas()
+
+    assert published(user, "preferredLanguage").required == Required.false
+
+
+def test_a_required_attribute_stays_required_on_a_field_with_null():
+    """The schema requires a userName, whatever its field."""
+    (user, _) = users_mapping({"userName": "display_name"}).schemas()
+
+    assert published(user, "userName").required == Required.true
+
+
+def test_the_entries_of_a_many_are_optional_but_their_values_may_be_required():
+    """A user may have no certificate, but a certificate has a value."""
+    certificates = Many("certificates", {"value": "value", "primary": "primary"})
+    (user, _) = users_mapping({"x509Certificates": certificates}).schemas()
+
+    attribute = published(user, "x509Certificates")
+    assert attribute.required == Required.false
+    assert [(sub.name, sub.required) for sub in attribute.sub_attributes] == [
+        ("value", Required.true),
+        ("primary", Required.false),
+    ]
+
+
+def test_an_entry_value_only_read_is_published_optional():
+    """The storage never writes certificates whose values are only read."""
+    certificates = Many("certificates", {"value": Attribute("value", writable=False)})
+    (user, _) = users_mapping({"x509Certificates": certificates}).schemas()
+
+    (value,) = published(user, "x509Certificates").sub_attributes
+    assert value.required == Required.false
+
+
+def test_a_complex_attribute_holding_a_required_value_is_published_required():
+    """An applicant cannot be created without a shift, which holds whether it is enabled."""
+    mapping = applicant_mapping(active=None, **{f"{OWNED}:shift.open": "enabled"})
+    (_, owned) = mapping.schemas()
+
+    shift = published(owned, "shift")
+    assert shift.required == Required.true
+    assert [(sub.name, sub.required) for sub in shift.sub_attributes] == [
+        ("open", Required.true)
+    ]
+
+
+def test_a_sub_attribute_required_by_its_schema_leaves_its_complex_optional():
+    """A manager has a value, but a user may have no manager."""
+    (_, enterprise) = users_mapping().schemas()
+
+    manager = published(enterprise, "manager")
+    assert manager.required == Required.false
+    (value,) = [sub for sub in manager.sub_attributes if sub.name == "value"]
+    assert value.required == Required.true
+
+
+@pytest.mark.parametrize(
+    "mapping,field",
+    [
+        pytest.param(lambda: applicant_mapping(active=None), "enabled", id="unmapped"),
+        pytest.param(
+            lambda: applicant_mapping(active=Attribute("enabled", writable=False)),
+            "enabled",
+            id="read-only",
+        ),
+        pytest.param(
+            lambda: applicant_mapping(**{f"{OWNED}:owner": None}),
+            "mentor",
+            id="foreign key",
+        ),
+        pytest.param(
+            lambda: ResourceMapping(
+                User, Person, {"id": "id", "meta.created": "created"}
+            ),
+            "last_modified",
+            id="date",
+        ),
+        pytest.param(
+            lambda: ResourceMapping(Group, Ticket, {"id": "number"}),
+            "number",
+            id="identifier",
+        ),
+        pytest.param(
+            lambda: ResourceMapping(Group, Counted, {"id": "id"}, version="writes"),
+            "writes",
+            id="version",
+        ),
+        pytest.param(
+            lambda: ResourceMapping(Group, Coded, {"id": "id"}),
+            "code",
+            id="unique text",
+        ),
+    ],
+)
+def test_a_field_needing_a_value_the_storage_never_writes_is_reported(mapping, field):
+    """Creating a record would fail in the database, but reading and replacing records work."""
+    mapping = mapping()
+    (warning,) = mapping.check()
+
+    assert warning.id == "scim2_django.W002"
+    assert not warning.is_serious()
+    assert f"The field {field!r} of tests." in warning.msg
+    assert mapping.schemas()
+
+
+def test_fields_filled_without_the_storage_are_accepted():
+    """Text, a default, a database default, a date set on each save, a generated field and the parent of an inherited model."""
+    assert person_mapping().check() == []
+    contractor = ResourceMapping(
+        User, Contractor, {"id": "id", "userName": "user_name"}
+    )
+    assert contractor.check() == []
+
+
+@pytest.mark.parametrize(
+    "path", ["badge", "card.value"], ids=["simple", "sub-attribute"]
+)
+def test_a_transformed_value_clients_read_needs_an_expression(path):
+    """Clients would read the badge as it is stored."""
+    with pytest.raises(ValueError, match="its Transformed needs an expression"):
+        ResourceMapping(
+            User[Owned],
+            Person,
+            REQUIRED | {f"{OWNED}:{path}": Transformed("user_name", to_field=str)},
+            version="version",
+        )
+
+
+def test_a_hidden_value_is_read_as_it_is_stored():
+    """The server sends the secret back as the storage read it."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Locker,
+        {"id": "id", f"{OWNED}:secret": Transformed("code", to_field=int)},
+    )
+    mapping.schemas()
+
+    column = mapping._column(f"{OWNED}:secret")
+    assert (column.key, column.expression) == ("code", None)
+
+
+def test_a_hidden_value_read_as_stored_needs_a_field_holding_its_type():
+    """The seal is a string, which the integer code cannot hold."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Locker,
+        {"id": "id", f"{OWNED}:seal": Transformed("code", to_field=int)},
+    )
+
+    assert error_ids(mapping) == ["scim2_django.E008"]
+
+
+def test_a_write_only_value_of_an_immutable_attribute_stays_write_only():
+    """Write-only wins: clients can change the pin of the card."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Person,
+        REQUIRED | {f"{OWNED}:card.pin": Transformed("user_name", to_field=str)},
+        version="version",
+    )
+
+    (_, owned) = mapping.schemas()
+    (pin,) = published(owned, "card").sub_attributes
+    assert pin.mutability == Mutability.write_only
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        Many("addresses", {"value": "value", "hint": "value"}),
+        Entry({"value": "user_name", "hint": "serial"}),
+    ],
+    ids=["many", "entry"],
+)
+def test_entries_cannot_hold_values_never_returned(keys):
+    """A replacement of the keys would lose their hints, which clients never send back."""
+    mapping = ResourceMapping(
+        User[Owned], Person, REQUIRED | {f"{OWNED}:keys": keys}, version="version"
+    )
+
+    assert error_ids(mapping) == ["scim2_django.E007"]
+
+
+def test_an_immutable_attribute_never_returned_is_read():
+    """The storage reads the seal to keep it from changing, and the server never returns it."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Person,
+        REQUIRED | {f"{OWNED}:seal": "user_name", f"{OWNED}:card.code": "user_name"},
+        version="version",
+    )
+    (_, owned) = mapping.schemas()
+
+    for name in ("seal", "card"):
+        attribute = published(owned, name)
+        assert (attribute.mutability, attribute.returned) == (
+            Mutability.immutable,
+            Returned.never,
+        )
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [("token", "code"), ("serial", "code")],
+    ids=["write-only", "never returned"],
+)
+def test_an_attribute_never_returned_is_published_optional_even_when_required(
+    name, value
+):
+    """Clients replacing a locker cannot send back what they never read."""
+    mapping = ResourceMapping(
+        User[Owned], Locker, {"id": "id", f"{OWNED}:{name}": value}
+    )
+    (_, owned) = mapping.schemas()
+
+    assert published(owned, name).required == Required.false
+
+
+def test_a_required_complex_attribute_holding_values_never_read_is_published_optional():
+    """Nothing of the owner is returned, so clients cannot send it back."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Person,
+        REQUIRED | {f"{OWNED}:owner.code": "user_name"},
+        version="version",
+    )
+    (_, owned) = mapping.schemas()
+
+    owner = published(owned, "owner")
+    assert (owner.returned, owner.required) == (Returned.never, Required.false)
+
+
+def test_a_complex_attribute_holding_values_never_read_is_published_write_only():
+    """Nothing of the sponsor is returned, so the sponsor is not either."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Person,
+        REQUIRED | {f"{OWNED}:sponsor.code": "user_name"},
+        version="version",
+    )
+    (_, owned) = mapping.schemas()
+
+    sponsor = published(owned, "sponsor")
+    assert (sponsor.mutability, sponsor.returned) == (
+        Mutability.write_only,
+        Returned.never,
+    )
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        pytest.param(
+            lambda: locker_mapping(Attribute("code", writable=False)),
+            id="write-only and unwritable",
+        ),
+        pytest.param(lambda: locker_mapping(Computed(F("code"))), id="computed"),
+        pytest.param(
+            lambda: ResourceMapping(
+                User[Owned],
+                Locker,
+                {"id": "id", f"{OWNED}:serial": Attribute("code", writable=False)},
+            ),
+            id="never returned and unwritable",
+        ),
+        pytest.param(
+            lambda: locker_mapping(Transformed("code", expression=F("code"))),
+            id="transformed",
+        ),
+    ],
+)
+def test_an_attribute_neither_read_nor_written_is_refused(mapping):
+    """The storage would ignore it."""
+    with pytest.raises(ValueError, match="could neither read nor write"):
+        mapping()
+
+
+@pytest.mark.parametrize(
+    "name", ["pin", "secret"], ids=["write-only", "never returned"]
+)
+def test_an_attribute_clients_never_read_is_not_mapped_to_a_generated_field(name):
+    """Clients could neither read nor write it."""
+    mapping = ResourceMapping(
+        User[Owned], Locker, {"id": "id", f"{OWNED}:{name}": "double"}
+    )
+
+    (error,) = mapping.check()
+
+    assert error.id == "scim2_django.E011"
+
+
+def test_a_unique_value_hidden_from_clients_is_not_checked_by_the_storage():
+    """A refusal would tell a client which serials other users hold."""
+    mapping = ResourceMapping(
+        User[Sealed],
+        UserRecord,
+        {"id": "id", "userName": "user_name", f"{SEALED}:serial": "serial"},
+    )
+    mapping.schemas()
+
+    assert [column.binding.urn for column in mapping._unique_columns()] == [
+        f"{User.__schema__}:userName"
+    ]
+
+
+def test_a_mapping_with_another_error_is_not_told_about_its_unwritten_fields():
+    """The unknown field may be the one that was meant to be written."""
+    mapping = applicant_mapping(active="enable")
+
+    assert error_ids(mapping) == ["scim2_django.E001"]
 
 
 def test_a_generated_field_is_published_read_only():
@@ -590,9 +1025,9 @@ def test_two_paths_to_the_same_attribute_are_refused():
     "value",
     [
         Computed(Value("2026-01-01")),
-        Attribute("created", readable=False),
+        Attribute("created", writable=False),
     ],
-    ids=["computed", "write-only"],
+    ids=["computed", "read-only"],
 )
 def test_the_dates_are_mapped_to_the_name_of_a_field(value):
     """The storage writes the dates and reads them back."""
@@ -638,7 +1073,7 @@ def test_a_link_that_can_be_removed_needs_a_nullable_foreign_key():
     """Removing the sponsor would set a foreign key that cannot be null."""
     mapping = ResourceMapping(
         User[Owned],
-        Person,
+        Applicant,
         REQUIRED | {f"{OWNED}:sponsor": Link("mentor", "User")},
         version="version",
     )
@@ -650,14 +1085,43 @@ def test_a_link_that_can_be_removed_needs_a_nullable_foreign_key():
 
 def test_a_required_link_takes_a_foreign_key_that_cannot_be_null():
     """The owner is always there, so its foreign key is never cleared."""
+    assert applicant_mapping().check() == []
+
+
+def test_a_required_link_of_a_resource_takes_a_foreign_key_that_cannot_be_null():
+    """Every device has an owner."""
     mapping = ResourceMapping(
-        User[Owned],
-        Person,
-        REQUIRED | {f"{OWNED}:owner": Link("mentor", "User")},
+        Device,
+        Applicant,
+        REQUIRED | {"enabled": "enabled", "owner": Link("mentor", "User")},
         version="version",
     )
 
     assert mapping.check() == []
+
+
+def test_a_link_does_not_display_a_name_never_returned():
+    """The members of a group would show the hidden names of the visitors."""
+    mapping = ResourceMapping(
+        Visitor, Person, REQUIRED | {"displayName": "user_name"}, version="version"
+    )
+    mapping.check()
+
+    assert mapping._display() is None
+
+
+def test_a_required_link_of_an_optional_extension_needs_a_nullable_foreign_key():
+    """A user without the owned extension has no owner."""
+    mapping = ResourceMapping(
+        User[Owned],
+        Applicant,
+        REQUIRED | {"active": "enabled", f"{OWNED}:owner": Link("mentor", "User")},
+        version="version",
+    )
+
+    (error,) = mapping.check()
+    assert error.id == "scim2_django.E003"
+    assert "left out with its extension" in error.msg
 
 
 @pytest.mark.parametrize(
@@ -684,12 +1148,13 @@ def test_a_binary_value_is_held_by_a_binary_field():
     assert mapping.check() == []
 
 
-def test_a_write_only_attribute_of_the_schema_is_never_read():
-    """The password is write-only in the schema, so mapping it by its name is enough to keep it from being read."""
+def test_a_write_only_attribute_of_the_schema_is_read_but_hidden_from_clients():
+    """The server sends the password back when a replacement leaves it out, but never returns it."""
     mapping = users_mapping({"password": "password"})
     mapping.schemas()
 
-    assert not mapping._column("password").readable
+    column = mapping._column("password")
+    assert column.concealed
 
 
 def test_the_checks_wait_for_the_models(monkeypatch):
@@ -778,11 +1243,9 @@ def test_the_type_of_a_link_is_found_in_each_link():
 @pytest.mark.parametrize(
     "emails",
     [
-        Many("emails", {"value": "value", "type": Attribute("type", readable=False)}),
-        Many("emails", {"value": Attribute("value", readable=False)}),
         Many("emails", {"value": "value", "type": Attribute("type", writable=False)}),
     ],
-    ids=["write-only next to readable", "write-only", "read-only next to written"],
+    ids=["read-only next to written"],
 )
 def test_entries_that_a_write_would_partly_lose_are_refused(emails):
     """A write replaces the entries, so a value the client never sends back would be lost."""
@@ -793,7 +1256,14 @@ def test_entries_that_a_write_would_partly_lose_are_refused(emails):
 
 def test_a_list_of_write_only_strings_is_refused():
     """A PATCH adding a tag would replace the tags clients never read back."""
-    (error,) = tagged_mapping(Attribute("value", readable=False)).check()
+    mapping = ResourceMapping(
+        User[Tagged],
+        TaggedUser,
+        REQUIRED | {"userName": "user_name", f"{TAGGED}:codes": Many("tags", "value")},
+        version="version",
+    )
+
+    (error,) = mapping.check()
 
     assert error.id == "scim2_django.E007"
 

@@ -4,14 +4,18 @@ from typing import Any
 
 from django.apps import apps as registry
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import UNUSABLE_PASSWORD_PREFIX
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import FieldDoesNotExist
 from django.core.exceptions import ImproperlyConfigured
+from django.db.models import Case
+from django.db.models import F
 from django.db.models import Model
 from django.db.models import TextField
 from django.db.models import UUIDField
 from django.db.models import Value
+from django.db.models import When
 from django.db.models.functions import Cast
 from django.db.models.functions import Concat
 from scim2_models import Group
@@ -46,9 +50,11 @@ def user_mapping(
     - ``active``, from ``is_active``;
     - ``password``, checked by the validators of
       :setting:`AUTH_PASSWORD_VALIDATORS`, written with
-      :func:`~django.contrib.auth.hashers.make_password`, and never read. A
-      user created without password, or with an empty one, gets an unusable
-      one;
+      :func:`~django.contrib.auth.hashers.make_password`. The storage reads
+      the hash, which the server never returns. A user created without
+      password, or with an empty one, gets an unusable one, which the storage
+      reads as no password. Removing the password makes it unusable, even an
+      empty one that a user created outside SCIM holds;
     - ``groups``, the groups of :mod:`django.contrib.auth`, from ``groups``;
     - ``meta.created``, from ``date_joined``.
 
@@ -70,7 +76,9 @@ def user_mapping(
     mapped: dict[str, Any] = {
         "id": _identifier(record, prefix),
         "userName": record.USERNAME_FIELD,
-        "password": Transformed("password", to_field=_password),
+        "password": Transformed(
+            "password", expression=_password_hash(), to_field=_password
+        ),
     }
     for path, name in (
         ("name.givenName", "first_name"),
@@ -244,6 +252,18 @@ def _identifier(record: type[Model], prefix: str) -> Any:
 
     expression = Concat(Value(prefix), text, output_field=TextField())
     return Transformed(key, expression=expression, to_field=_without(prefix))
+
+
+def _password_hash() -> Case:
+    """Return the hash of the password of a user, None for an unusable password.
+
+    An empty password is read as it is, so that removing it makes it unusable.
+    """
+    return Case(
+        When(password__startswith=UNUSABLE_PASSWORD_PREFIX, then=None),
+        default=F("password"),
+        output_field=TextField(),
+    )
 
 
 def _password(value: str | None) -> str:

@@ -24,7 +24,7 @@ from scim2_models import Resource
 from .mapping import ResourceMapping
 from .mapping import _Collection
 from .mapping import _Column
-from .mapping import _needs_value
+from .mapping import _field_needs_value
 from .mapping import _Storage
 
 
@@ -84,12 +84,12 @@ def _related_record(column: _Column, record: Any) -> Any:
 
 
 def _read(column: _Column, record: Any) -> Any:
-    """Return the SCIM value of a column of a record, or None if the column is not read.
+    """Return the SCIM value of a column of a record.
 
     An empty string is no value, as Django text fields store it.
     """
     value = _get(column, record)
-    if value is None or not column.readable or (value == "" and column.empty_string):
+    if value is None or (value == "" and column.empty_string):
         return None
 
     return _as_scim(value)
@@ -100,19 +100,13 @@ def _version(mapping: ResourceMapping, record: Any, resource: Resource[Any]) -> 
 
     The hash covers the whole resource but its version, so that any change
     of the resource changes it, a change of its links included. It covers the
-    values of the write-only attributes too, which the resource does not
-    hold. It is keyed with the SECRET_KEY setting, so that a version tells
-    nothing about these values.
+    values hidden from clients too, so it is keyed with the SECRET_KEY setting:
+    a version tells nothing about these values.
     """
     if mapping.version is not None:
         return f'W/"{getattr(record, mapping.version)}"'
 
-    hidden = {
-        column.binding.urn: repr(_get(column, record))
-        for column in mapping._columns.values()
-        if not column.readable
-    }
-    data = json.dumps([resource.model_dump(mode="json"), hidden], sort_keys=True)
+    data = json.dumps(resource.model_dump(mode="json"), sort_keys=True)
     digest = salted_hmac("scim2_django.version", data, algorithm="sha256")
     return f'W/"{digest.hexdigest()[:32]}"'
 
@@ -271,7 +265,7 @@ def _from_scim(
             continue
 
         value = Path(column.binding.urn).get(resource, strict=False)
-        if value is None and _keeps(column, creating):
+        if _keeps(column, value, record, creating):
             continue
 
         setattr(record, column.field_key, _stored(column, value))
@@ -284,7 +278,7 @@ def _from_scim(
         item = entries[0] if entries else None
         for column in entry.columns.values():
             value = getattr(item, column.binding.target_field_name, None)
-            if value is None and _keeps(column, creating):
+            if _keeps(column, value, record, creating):
                 continue
 
             setattr(record, column.field_key, _stored(column, value))
@@ -302,17 +296,18 @@ def _dates(
     return [(column, now) for column in columns if column is not None]
 
 
-def _keeps(column: _Column, creating: bool) -> bool:
-    """Tell whether a missing value leaves a field as it is.
+def _keeps(column: _Column, value: Any, record: Any, creating: bool) -> bool:
+    """Tell whether a value leaves a field as it is.
 
-    When creating the record, the field keeps its default, unless to_field
-    gives its value for no value. A write-only value is kept, since a resource
-    never carries it back.
+    When creating the record, a missing value keeps the default of the field,
+    unless to_field gives its value for no value. When updating it, a value
+    equal to the one the storage read is kept, without calling to_field, so
+    that a password hash is not hashed again.
     """
     if creating:
-        return not column.transformed
+        return value is None and not column.transformed
 
-    return not column.readable
+    return bool(value == _read(column, record))
 
 
 def _stored(column: _Column, value: Any) -> Any:
@@ -385,8 +380,9 @@ def _write_related(
 
     A missing value is not written in a new related record, nor when creating
     the resource, so that the field keeps its default, unless to_field gives
-    its value for no value. A new related record needs a value for each mapped
-    field without default.
+    its value for no value. A related record missing when the resource was
+    read is new. A new related record needs a value for each mapped field
+    without default.
     """
     values: dict[Any, list[tuple[_Column, Any]]] = {}
     for column in mapping._columns.values():
@@ -394,7 +390,8 @@ def _write_related(
             continue
 
         value = Path(column.binding.urn).get(resource, strict=False)
-        if value is None and _keeps(column, creating):
+        new = creating or _related_record(column, record) is None
+        if _keeps(column, value, record, new):
             continue
 
         values.setdefault(column.relation, []).append((column, value))
@@ -437,7 +434,7 @@ def _check_creatable(
     given = {column for column, _ in written}
     for column in mapping._columns.values():
         if column.relation is relation and column not in given:
-            if not column.nullable and _needs_value(column.field):  # type: ignore[arg-type]
+            if not column.nullable and _field_needs_value(column.field):  # type: ignore[arg-type]
                 raise InvalidValueException(
                     detail=f"'{column.binding.urn}' is required on this server"
                 )

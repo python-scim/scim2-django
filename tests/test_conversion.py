@@ -28,6 +28,7 @@ from .mappings import groups_mapping
 from .mappings import users_mapping
 from .models import CertificateRecord
 from .models import GroupRecord
+from .models import Locker
 from .models import Person
 from .models import TaggedUser
 from .models import UserRecord
@@ -36,6 +37,7 @@ from .test_mapping import REQUIRED
 from .test_mapping import TAGGED
 from .test_mapping import Owned
 from .test_mapping import Tagged
+from .test_mapping import applicant_mapping
 from .test_mapping import tagged_mapping
 
 NOW = datetime.datetime(2026, 11, 19, 8, 0, tzinfo=datetime.UTC)
@@ -114,8 +116,7 @@ def test_a_user_is_written_and_read_back():
     assert user.user_name == "bjensen"
     assert user.name.given_name == "Barbara"
     assert user.active is True
-    assert user.password is None
-    assert record.password == "secret"
+    assert user.password == record.password == "secret"
     assert user.locale == "bjensen"
     assert [(e.value, e.type, e.primary) for e in user.emails] == [
         ("bjensen@example.com", "work", True),
@@ -223,8 +224,8 @@ def test_an_update_clears_the_missing_values():
     assert record.title is None
 
 
-def test_an_update_keeps_a_write_only_value_it_does_not_carry():
-    """A resource never carries its password back, so its absence changes nothing."""
+def test_an_update_without_a_write_only_value_removes_it():
+    """The server sends back the password it read, so a resource without it has no password."""
     users, _ = bound()
     record = UserRecord.objects.create(
         user_name="bjensen", password="secret", created=NOW, last_modified=NOW
@@ -232,7 +233,7 @@ def test_an_update_keeps_a_write_only_value_it_does_not_carry():
 
     record = save(users, users.model(user_name="bjensen"), record, creating=False)
 
-    assert record.password == "secret"
+    assert record.password is None
 
 
 def test_read_only_entries_cannot_change():
@@ -503,7 +504,40 @@ def test_missing_values_of_a_list_are_left_out():
 
 
 def test_a_new_resource_needs_the_values_its_fields_cannot_do_without():
-    """Whether a person is enabled has neither null nor a default, so creating one without it is refused."""
+    """Whether an applicant is enabled has neither null nor a default, so creating one without it is refused."""
+    mapping = applicant_mapping()
+    mapping.schemas()
+
+    _check_storable(mapping, mapping.model(active=True), None)
+    with pytest.raises(InvalidValueException, match=":active' is required"):
+        _check_storable(mapping, mapping.model(), None)
+
+
+def test_a_new_resource_needs_a_write_only_value_its_field_cannot_do_without():
+    """The schema leaves it optional, so that clients can replace a resource they read, but a creation needs it."""
+    mapping = ResourceMapping(User[Owned], Locker, {"id": "id", f"{OWNED}:pin": "code"})
+    mapping.schemas()
+
+    with pytest.raises(InvalidValueException, match=":pin' is required"):
+        _check_storable(mapping, mapping.model(), None)
+
+
+def test_a_replacement_without_a_value_never_returned_removes_it():
+    """The server sends back the secret it read, so a replacement without it removes it, which its field refuses."""
+    mapping = ResourceMapping(
+        User[Owned], Locker, {"id": "id", f"{OWNED}:secret": "code"}
+    )
+    mapping.schemas()
+    locker = Locker.objects.create(code=7)
+    stored = to_scim(mapping, locker)
+    assert stored[Owned].secret == 7
+
+    with pytest.raises(MutabilityException, match=":secret' cannot be removed"):
+        _check_storable(mapping, mapping.model(), stored)
+
+
+def test_a_new_resource_may_leave_out_the_values_its_fields_get_by_themselves():
+    """A default, a database default and a date set on each save fill the fields."""
     mapping = ResourceMapping(
         User[Owned],
         Person,
@@ -518,9 +552,7 @@ def test_a_new_resource_needs_the_values_its_fields_cannot_do_without():
     )
     mapping.schemas()
 
-    _check_storable(mapping, mapping.model(active=True), None)
-    with pytest.raises(InvalidValueException, match=":active' is required"):
-        _check_storable(mapping, mapping.model(title="Ms"), None)
+    _check_storable(mapping, mapping.model(), None)
 
 
 def test_a_converting_field_is_read_through_its_conversion():
@@ -532,15 +564,8 @@ def test_a_converting_field_is_read_through_its_conversion():
         version="version",
     )
     mapping.schemas()
-    mentor = UserRecord.objects.create(user_name="m", created=NOW, last_modified=NOW)
     Person.objects.create(
-        id="p",
-        user_name="a",
-        code="ceo",
-        enabled=True,
-        mentor=mentor,
-        created=NOW,
-        last_modified=NOW,
+        id="p", user_name="a", code="ceo", created=NOW, last_modified=NOW
     )
 
     assert to_scim(mapping, Person.objects.get()).title == "CEO"
@@ -569,8 +594,7 @@ def test_an_empty_string_is_no_value():
         User, Person, REQUIRED | {"userName": "user_name"}, version="version"
     )
     mapping.schemas()
-    mentor = UserRecord.objects.create(user_name="m", created=NOW, last_modified=NOW)
-    person = Person(id="p", user_name="a", mentor=mentor, enabled=True, created=NOW)
+    person = Person(id="p", user_name="a", created=NOW)
 
     _check_storable(mapping, User(), User(user_name="a"))
     person = save(mapping, User(), person, creating=False)

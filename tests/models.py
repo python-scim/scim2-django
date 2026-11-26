@@ -3,6 +3,7 @@ import uuid
 from django.contrib.auth.models import AbstractBaseUser
 from django.contrib.auth.models import Group as AuthGroup
 from django.db import models
+from django.db.models import F
 from django.db.models.functions import Lower
 
 
@@ -151,21 +152,78 @@ class BadgeRecord(models.Model):
 class Person(models.Model):
     """A model for the mappings the checks refuse."""
 
-    id = models.CharField(primary_key=True, max_length=64)
+    id = models.CharField(primary_key=True, max_length=64, default=uuid.uuid4)
     user_name = models.TextField()
     serial = models.TextField(unique=True, null=True)
     data = models.JSONField(null=True)
     code = CodeField(null=True)
     status = models.TextField(default="new")
     note = LooseTextField(null=True)
-    enabled = models.BooleanField()
+    enabled = models.BooleanField(default=True)
     verified = models.BooleanField(db_default=False)
     touched = models.DateTimeField(auto_now=True)
-    mentor = models.ForeignKey(UserRecord, on_delete=models.CASCADE)
     label = models.TextField(null=True, choices=[("Mr", "Mister"), ("Ms", "Miss")])
     created = models.DateTimeField()
     last_modified = models.DateTimeField()
     version = models.PositiveIntegerField(default=1)
+
+
+class Applicant(models.Model):
+    """A model whose records cannot be created without a boolean and a mentor."""
+
+    id = models.CharField(primary_key=True, max_length=64, default=uuid.uuid4)
+    enabled = models.BooleanField()
+    mentor = models.ForeignKey(UserRecord, on_delete=models.CASCADE)
+    created = models.DateTimeField()
+    last_modified = models.DateTimeField()
+    version = models.PositiveIntegerField(default=1)
+
+
+class Volunteer(models.Model):
+    """A user that cannot be created without saying whether it is active."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    user_name = models.TextField(unique=True)
+    active = models.BooleanField()
+    version = models.PositiveIntegerField(default=1)
+
+
+class Locker(models.Model):
+    """A record holding a code that clients set but never read back."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    code = models.IntegerField()
+    double = models.GeneratedField(
+        expression=F("code") * 2,
+        output_field=models.IntegerField(),
+        db_persist=True,
+    )
+
+
+class Counted(models.Model):
+    """A record counting its writes in a field without default."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    writes = models.PositiveIntegerField()
+
+
+class Coded(models.Model):
+    """A record whose unique code cannot be the empty string twice."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    code = models.TextField(unique=True)
+
+
+class Contractor(UserRecord):
+    """A user stored in two tables, its own one holding the company."""
+
+    company = models.TextField()
+
+
+class Ticket(models.Model):
+    """A record whose primary key is a number that nothing gives."""
+
+    number = models.IntegerField(primary_key=True)
 
 
 class Address(models.Model):

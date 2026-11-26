@@ -36,6 +36,13 @@ Changed
   :class:`~scim2_django.storage.Link` of an optional extension. A resource without the extension
   raised a database error.
 
+Fixed
+^^^^^
+- Deleting a resource that another record refers to, or writing a link to a resource deleted in
+  the meantime, answers a ``409``, instead of an error ``500``. With
+  :setting:`ATOMIC_REQUESTS <DATABASE-ATOMIC_REQUESTS>` on PostgreSQL and SQLite, the database
+  only refuses the change when the request commits, and the request still fails with a ``500``.
+
 [0.1.1] - 2026-11-24
 --------------------
 

@@ -37,3 +37,9 @@ errors with a response, without raising: the transaction of the request is commi
 The transaction of each operation is then a savepoint in the transaction of the request. The
 savepoint of a failed operation is rolled back, and the other changes are committed with the
 request.
+
+On PostgreSQL and SQLite, the database checks the foreign keys that Django creates when the
+transaction commits. Without :setting:`ATOMIC_REQUESTS <DATABASE-ATOMIC_REQUESTS>`,
+:class:`~scim2_django.storage.DjangoStorage` answers a ``409`` when a foreign key refuses a
+change, such as the deletion of a user another record refers to. With it, the request commits
+after the site answers, and a change a foreign key refuses fails the request with a ``500``.

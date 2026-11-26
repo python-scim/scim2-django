@@ -149,6 +149,24 @@ class BadgeRecord(models.Model):
     user = models.ForeignKey(UserRecord, on_delete=models.PROTECT)
 
 
+class AliasRecord(models.Model):
+    """A record outside SCIM, whose email cannot be deleted while it exists."""
+
+    email = models.ForeignKey(EmailRecord, on_delete=models.PROTECT)
+
+
+class PassRecord(models.Model):
+    """A record outside SCIM, whose user cannot be deleted while it exists, unless along with it."""
+
+    user = models.ForeignKey(UserRecord, on_delete=models.RESTRICT)
+
+
+class LogRecord(models.Model):
+    """A record outside SCIM, whose foreign key to its user only the database enforces."""
+
+    user = models.ForeignKey(UserRecord, on_delete=models.DO_NOTHING)
+
+
 class Person(models.Model):
     """A model for the mappings the checks refuse."""
 

@@ -1,47 +1,34 @@
 Changelog
 =========
 
-[Unreleased]
-------------
+[0.2.0] - 2026-11-26
+--------------------
 
 Added
 ^^^^^
 - :meth:`ResourceMapping.schemas() <scim2_django.storage.ResourceMapping.schemas>` publishes
-  ``required`` for an attribute the storage cannot create a resource without, and for a complex
-  attribute holding such a sub-attribute.
-- The warning ``scim2_django.W002`` reports a field of the resource model that needs a value, and
-  that the storage never writes. Creating a resource then raises a database error.
-- The check ``scim2_django.E011`` refuses an attribute that clients never read, write-only or never
-  returned, mapped to a generated field.
+  ``required`` for an attribute whose field needs a value.
+- ``manage.py check`` warns about a field that needs a value but that the storage never writes
+  (``W002``), and refuses a write-only or never returned attribute mapped to a generated field
+  (``E011``).
 
 Changed
 ^^^^^^^
 - Needs scim2-server 0.8.9 and scim2-models 0.12.7 or later.
-- The storage reads the attributes hidden from clients, write-only or never returned, and the
-  server never returns them. A PUT without such a value keeps it, and a PATCH can remove it. A
-  value sent back as the storage read it is not written again, so the hash of a password is not
-  hashed again. A hidden attribute is published
-  optional, even when its schema requires it. It cannot be filtered nor sorted on, and the storage
-  does not check its uniqueness. The check ``scim2_django.E007`` refuses it in the entries of a
-  :class:`~scim2_django.storage.Many` or an :class:`~scim2_django.storage.Entry`. A link does not
-  display it.
-- :class:`~scim2_django.storage.Attribute` no longer takes ``readable``: the storage reads every
-  attribute. A :class:`~scim2_django.storage.Transformed` without ``expression`` reads its field as
-  it is stored. A mapping refuses it for an attribute that clients read: give it an
-  ``expression``, or make the attribute write-only in its schema.
-- The ``password`` of :func:`~scim2_django.auth.user_mapping` is read as its hash, and as no value
-  for an unusable password. Removing it makes it unusable.
-- A mapping refuses an attribute that clients could neither read nor write.
-- The check ``scim2_django.E003`` refuses a foreign key without null for a required
-  :class:`~scim2_django.storage.Link` of an optional extension. A resource without the extension
-  raised a database error.
+- The storage reads the write-only and never returned attributes, such as the password hash of
+  :func:`~scim2_django.auth.user_mapping`. A PUT without such a value keeps it, and a PATCH can
+  remove it. Clients cannot filter nor sort on it.
+- :class:`~scim2_django.storage.Attribute` no longer takes ``readable``. A
+  :class:`~scim2_django.storage.Transformed` without ``expression`` only maps a write-only or
+  never returned attribute.
 
 Fixed
 ^^^^^
-- Deleting a resource that another record refers to, or writing a link to a resource deleted in
-  the meantime, answers a ``409``, instead of an error ``500``. With
-  :setting:`ATOMIC_REQUESTS <DATABASE-ATOMIC_REQUESTS>` on PostgreSQL and SQLite, the database
-  only refuses the change when the request commits, and the request still fails with a ``500``.
+- A change that a foreign key refuses answers a ``409`` instead of a ``500``, unless
+  :setting:`ATOMIC_REQUESTS <DATABASE-ATOMIC_REQUESTS>` defers the check to the commit, on
+  PostgreSQL and SQLite.
+- ``E003`` refuses a foreign key without null for a required :class:`~scim2_django.storage.Link`
+  of an optional extension, which raised a database error.
 
 [0.1.1] - 2026-11-24
 --------------------

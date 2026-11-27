@@ -10,18 +10,20 @@ from scim2_models import Group
 from scim2_models import InvalidValueException
 from scim2_models import MutabilityException
 from scim2_models import User
+from scim2_server.mapping.conversion import check_storable
+from scim2_server.mapping.conversion import comparable
+from scim2_server.mapping.conversion import link_entries
+from scim2_server.utils import load_default_provider
 
 from scim2_django.storage import Attribute
 from scim2_django.storage import Computed
 from scim2_django.storage import Many
 from scim2_django.storage import ResourceMapping
-from scim2_django.storage.conversion import _as_scim
-from scim2_django.storage.conversion import _check_storable
-from scim2_django.storage.conversion import _comparable
 from scim2_django.storage.conversion import _from_scim
-from scim2_django.storage.conversion import _link_entries
 from scim2_django.storage.conversion import _to_scim
 from scim2_django.storage.conversion import _write_collections
+from scim2_django.storage.mapping import _as_scim
+from scim2_django.storage.mapping import _as_stored
 
 from .mappings import ENTERPRISE
 from .mappings import groups_mapping
@@ -246,7 +248,7 @@ def test_read_only_entries_cannot_change():
     stored = users.model(user_name="a", emails=[{"value": "kept@example.com"}])
 
     with pytest.raises(MutabilityException, match="read-only on this server"):
-        _check_storable(
+        check_storable(
             users,
             users.model(user_name="a", emails=[{"value": "new@example.com"}]),
             stored,
@@ -326,7 +328,7 @@ def test_an_attribute_the_mapping_does_not_store_is_refused():
     users, _ = bound()
 
     with pytest.raises(InvalidValueException, match="phoneNumbers"):
-        _check_storable(
+        check_storable(
             users, users.model(user_name="a", phone_numbers=[{"value": "1"}]), None
         )
 
@@ -336,7 +338,7 @@ def test_a_read_only_attribute_cannot_change():
     users, _ = bound()
 
     with pytest.raises(MutabilityException, match="read-only on this server"):
-        _check_storable(users, users.model(user_name="a", locale="fr"), None)
+        check_storable(users, users.model(user_name="a", locale="fr"), None)
 
 
 def test_a_value_equal_to_the_stored_one_is_accepted():
@@ -344,7 +346,7 @@ def test_a_value_equal_to_the_stored_one_is_accepted():
     users, _ = bound()
     stored = users.model(user_name="a", locale="a")
 
-    _check_storable(users, users.model(user_name="a", locale="a"), stored)
+    check_storable(users, users.model(user_name="a", locale="a"), stored)
 
 
 def test_a_value_the_field_cannot_lose_is_kept():
@@ -355,7 +357,7 @@ def test_a_value_the_field_cannot_lose_is_kept():
     mapping.schemas()
 
     with pytest.raises(MutabilityException, match="cannot be removed"):
-        _check_storable(mapping, User(), User(active=True))
+        check_storable(mapping, User(), User(active=True))
 
 
 def test_a_value_outside_the_choices_is_refused():
@@ -365,16 +367,30 @@ def test_a_value_outside_the_choices_is_refused():
     )
     mapping.schemas()
 
-    _check_storable(mapping, User(title="Ms"), None)
+    check_storable(mapping, User(title="Ms"), None)
     with pytest.raises(InvalidValueException, match="cannot hold 'Dr'"):
-        _check_storable(mapping, User(title="Dr"), None)
+        check_storable(mapping, User(title="Dr"), None)
+
+
+def test_a_value_outside_the_choices_is_refused_in_a_resource_of_the_provider():
+    """The server builds the resources with the models of its provider, not with the model of the mapping."""
+    provider = load_default_provider()
+    user_type = next(rt for rt in provider.resource_types if rt.id == "User")
+    model = provider.model_for(user_type)
+    mapping = ResourceMapping(
+        User, Person, REQUIRED | {"title": "label"}, version="version"
+    )
+    mapping.schemas()
+
+    with pytest.raises(InvalidValueException, match="cannot hold 'Dr'"):
+        check_storable(mapping, model(title="Dr"), None)
 
 
 def test_the_display_of_a_link_is_ignored():
     """A member display is read from the linked resource, so a client may send any."""
     _, groups = bound()
 
-    _check_storable(groups, Group(members=[{"value": "1", "display": "Whoever"}]), None)
+    check_storable(groups, Group(members=[{"value": "1", "display": "Whoever"}]), None)
 
 
 def test_a_link_without_value_is_refused():
@@ -382,18 +398,18 @@ def test_a_link_without_value_is_refused():
     _, groups = bound()
 
     with pytest.raises(InvalidValueException, match="entry without value"):
-        _link_entries(groups, Group(members=[{"display": "x"}]))
+        link_entries(groups, Group(members=[{"display": "x"}]))
 
 
 def test_the_links_of_a_resource_are_listed_by_attribute():
     """Each written attribute linking to resources comes with its Links and its entries."""
     users, groups = bound()
 
-    links = _link_entries(groups, Group(members=[{"value": "1"}, {"value": "2"}]))
+    links = link_entries(groups, Group(members=[{"value": "1"}, {"value": "2"}]))
     ((collections_, entries),) = links
     assert [c.resource_type for c in collections_] == ["User", "Group"]
     assert [entry.value for entry in entries] == ["1", "2"]
-    user_links = _link_entries(
+    user_links = link_entries(
         users, users.model.model_validate({ENTERPRISE: {"manager": {"value": "3"}}})
     )
     assert [(c[0].resource_type, [e.value for e in e_]) for c, e_ in user_links] == [
@@ -403,15 +419,15 @@ def test_the_links_of_a_resource_are_listed_by_attribute():
 
 def test_missing_values_in_entries_are_no_value():
     """A path through entries holding none of a sub-attribute gives no value."""
-    assert _comparable([None, None]) is None
-    assert _comparable(["a", None]) == ["a", None]
+    assert comparable([None, None]) is None
+    assert comparable(["a", None]) == ["a", None]
 
 
 def test_a_date_with_a_time_zone_is_compared_in_utc():
     """Two dates of the same instant compare equal, whatever their time zone."""
     paris = datetime.timezone(datetime.timedelta(hours=1))
 
-    assert _comparable(
+    assert comparable(
         datetime.datetime(2026, 1, 1, 9, tzinfo=paris)
     ) == datetime.datetime(2026, 1, 1, 8, tzinfo=datetime.UTC)
 
@@ -468,14 +484,14 @@ def test_an_entry_without_a_value_its_field_needs_is_refused():
             }
         )
     )
-    _check_storable(
+    check_storable(
         users, users.model(user_name="a", x509_certificates=[{"value": "AAE="}]), None
     )
 
     with pytest.raises(
         InvalidValueException, match="x509Certificates.value' is required"
     ):
-        _check_storable(
+        check_storable(
             users,
             users.model(user_name="a", x509_certificates=[{"display": "x"}]),
             None,
@@ -487,7 +503,7 @@ def test_dates_are_written_without_time_zone_when_use_tz_is_off(settings):
     settings.USE_TZ = False
     paris = datetime.timezone(datetime.timedelta(hours=1))
 
-    assert _comparable(
+    assert _as_stored(
         datetime.datetime(2026, 1, 1, 9, tzinfo=paris)
     ) == datetime.datetime(2026, 1, 1, 8)
 
@@ -508,9 +524,9 @@ def test_a_new_resource_needs_the_values_its_fields_cannot_do_without():
     mapping = applicant_mapping()
     mapping.schemas()
 
-    _check_storable(mapping, mapping.model(active=True), None)
+    check_storable(mapping, mapping.model(active=True), None)
     with pytest.raises(InvalidValueException, match=":active' is required"):
-        _check_storable(mapping, mapping.model(), None)
+        check_storable(mapping, mapping.model(), None)
 
 
 def test_a_new_resource_needs_a_write_only_value_its_field_cannot_do_without():
@@ -519,7 +535,7 @@ def test_a_new_resource_needs_a_write_only_value_its_field_cannot_do_without():
     mapping.schemas()
 
     with pytest.raises(InvalidValueException, match=":pin' is required"):
-        _check_storable(mapping, mapping.model(), None)
+        check_storable(mapping, mapping.model(), None)
 
 
 def test_a_replacement_without_a_value_never_returned_removes_it():
@@ -533,7 +549,7 @@ def test_a_replacement_without_a_value_never_returned_removes_it():
     assert stored[Owned].secret == 7
 
     with pytest.raises(MutabilityException, match=":secret' cannot be removed"):
-        _check_storable(mapping, mapping.model(), stored)
+        check_storable(mapping, mapping.model(), stored)
 
 
 def test_a_new_resource_may_leave_out_the_values_its_fields_get_by_themselves():
@@ -552,7 +568,7 @@ def test_a_new_resource_may_leave_out_the_values_its_fields_get_by_themselves():
     )
     mapping.schemas()
 
-    _check_storable(mapping, mapping.model(), None)
+    check_storable(mapping, mapping.model(), None)
 
 
 def test_a_converting_field_is_read_through_its_conversion():
@@ -583,7 +599,7 @@ def test_an_entry_may_leave_out_a_value_its_field_has_a_default_for():
         )
     )
 
-    _check_storable(
+    check_storable(
         users, users.model(user_name="a", x509_certificates=[{"value": "AAE="}]), None
     )
 
@@ -596,7 +612,7 @@ def test_an_empty_string_is_no_value():
     mapping.schemas()
     person = Person(id="p", user_name="a", created=NOW)
 
-    _check_storable(mapping, User(), User(user_name="a"))
+    check_storable(mapping, User(), User(user_name="a"))
     person = save(mapping, User(), person, creating=False)
 
     assert person.user_name == ""

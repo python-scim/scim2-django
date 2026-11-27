@@ -207,7 +207,7 @@ def test_link_maps_a_complex_attribute_only():
 
 def test_an_attribute_is_mapped_to_the_name_of_a_field():
     """A field object, or any other value, cannot be resolved later."""
-    with pytest.raises(ValueError, match="must be mapped to the name of a field"):
+    with pytest.raises(ValueError, match="'userName' cannot be mapped to <django"):
         person_mapping(userName=Person._meta.get_field("user_name"))
 
 
@@ -623,7 +623,7 @@ def test_a_field_needing_a_value_the_storage_never_writes_is_reported(mapping, f
 
     assert warning.id == "scim2_django.W002"
     assert not warning.is_serious()
-    assert f"The field {field!r} of tests." in warning.msg
+    assert f"The field {field!r} needs a value" in warning.msg
     assert mapping.schemas()
 
 
@@ -941,7 +941,9 @@ def test_a_link_holds_the_records_of_the_mapping_it_links_to():
     groups = groups_mapping({"members": Link("members", "User")})
     groups.schemas()
 
-    with pytest.raises(ImproperlyConfigured, match="links to tests.UserRecord records"):
+    with pytest.raises(
+        ImproperlyConfigured, match="links to other records than those of the mapping"
+    ):
         groups._bind(groups._targets({"User": groups}))
 
 
@@ -1062,10 +1064,12 @@ def test_a_single_valued_attribute_is_mapped_to_one_link():
 def test_the_fields_of_the_entries_are_named():
     """A field object, or any other value, cannot be resolved later."""
     field = Person._meta.get_field("label")
-    with pytest.raises(ValueError, match="'emails.value' must be mapped to the name"):
+    with pytest.raises(ValueError, match="'emails.value' cannot be mapped to <django"):
         person_mapping(emails=Many("addresses", {"value": field}))
 
-    with pytest.raises(ValueError, match=f"'{TAGGED}:tags' must be mapped to the name"):
+    with pytest.raises(
+        ValueError, match=f"'{TAGGED}:tags' cannot be mapped to <django"
+    ):
         tagged_mapping(field)
 
 
@@ -1080,7 +1084,7 @@ def test_a_link_that_can_be_removed_needs_a_nullable_foreign_key():
 
     (error,) = mapping.check()
     assert error.id == "scim2_django.E003"
-    assert "needs null=True" in error.msg
+    assert "its relation needs to hold null" in error.msg
 
 
 def test_a_required_link_takes_a_foreign_key_that_cannot_be_null():

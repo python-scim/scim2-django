@@ -1,6 +1,20 @@
 Changelog
 =========
 
+[Unreleased]
+------------
+
+Changed
+^^^^^^^
+- Needs scim2-server 0.9.0 or later.
+- The storage is built on the mapping core of scim2-server, :mod:`scim2_server.mapping`, which
+  scim2-sqlalchemy shares. Some messages of the system checks change, their identifiers do not.
+
+Fixed
+^^^^^
+- A value outside the ``choices`` of its field is refused when the resource comes from the
+  provider of the server, and not only when it is an instance of the model of the mapping.
+
 [0.2.0] - 2026-11-26
 --------------------
 

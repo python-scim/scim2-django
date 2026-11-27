@@ -1606,7 +1606,7 @@ mariadb = [
 requires-dist = [
     { name = "django", specifier = ">=5.2" },
     { name = "scim2-models", specifier = ">=0.12.7" },
-    { name = "scim2-server", specifier = ">=0.8.9" },
+    { name = "scim2-server", specifier = ">=0.9.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -1621,7 +1621,7 @@ dev = [
     { name = "pytest-mysql", specifier = ">=5.0.1" },
     { name = "pytest-postgresql", specifier = ">=10.0.0" },
     { name = "scim2-client", specifier = ">=0.14.1" },
-    { name = "scim2-server", extras = ["cursor"], specifier = ">=0.8.9" },
+    { name = "scim2-server", extras = ["cursor"], specifier = ">=0.9.0" },
     { name = "scim2-tester", extras = ["testing"], specifier = ">=0.6.6" },
     { name = "tox-uv", specifier = ">=1.36.0" },
 ]
@@ -1649,14 +1649,14 @@ wheels = [
 
 [[package]]
 name = "scim2-server"
-version = "0.8.9"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "scim2-models" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/02/34/d308685d2c491e34812301d83dbd24730279f23dbda63421ce3347381a6f/scim2_server-0.8.9.tar.gz", hash = "sha256:21946681ab14746732ddc59201d0493c276d06d2c01902a5da1b6b4b4dccb41c", size = 73743, upload-time = "2026-11-26T10:59:57.398Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/83/1d/29fb908e3c6cf5278ebf184e42757a634ce799fef332dfd4f8b793c5b1bc/scim2_server-0.9.0.tar.gz", hash = "sha256:2f7f6c34a9483c4a96ff5f65978a89e0f2e759fdc12dc5c03b6f517330d5b012", size = 90228, upload-time = "2026-11-27T08:53:54.929Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2d/1d/175c71451ce2ee91b490dc23a988aec3ccc88cf7ef45aeb9965276e34282/scim2_server-0.8.9-py3-none-any.whl", hash = "sha256:f701de00f104f620145d2c6257fcd3e4410255e7c1a74ca2608071b431c76faa", size = 77812, upload-time = "2026-11-26T10:59:56.017Z" },
+    { url = "https://files.pythonhosted.org/packages/57/e6/0303d934ffd1c5101454b6bc74cd3bcfd40c65cc6c12d960d0bb9218afda/scim2_server-0.9.0-py3-none-any.whl", hash = "sha256:fde186347764c941400c08eba6ae3d5022fbfe76aa83e63d14d54f8456e4148e", size = 97077, upload-time = "2026-11-27T08:53:53.534Z" },
 ]
 
 [package.optional-dependencies]

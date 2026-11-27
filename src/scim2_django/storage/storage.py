@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any
+from typing import cast
 
 from django.core.exceptions import ImproperlyConfigured
 from django.db import DEFAULT_DB_ALIAS
@@ -14,7 +15,6 @@ from django.db.models import F
 from django.db.models import ProtectedError
 from django.db.models import RestrictedError
 from scim2_models import ConflictException
-from scim2_models import InvalidValueException
 from scim2_models import NotFoundException
 from scim2_models import Path
 from scim2_models import PreconditionFailedException
@@ -30,23 +30,24 @@ from scim2_server.keyset import Bound
 from scim2_server.keyset import Position
 from scim2_server.keyset import keyset_page
 from scim2_server.keyset import page_rows
+from scim2_server.mapping import Collection
+from scim2_server.mapping.conversion import assign_links
+from scim2_server.mapping.conversion import check_storable
+from scim2_server.mapping.conversion import comparable
+from scim2_server.mapping.conversion import link_entries
+from scim2_server.mapping.filters import compare
 from scim2_server.storage import ScimStorage
 from scim2_server.storage import SearchPage
 
 from .comparison import _Comparator
 from .comparison import _comparator
 from .comparison import _vendor
-from .conversion import _as_stored
-from .conversion import _check_storable
-from .conversion import _comparable
 from .conversion import _from_scim
-from .conversion import _link_entries
 from .conversion import _to_scim
 from .conversion import _write_collections
 from .mapping import ResourceMapping
-from .mapping import _Collection
-from .query import _compare
-from .query import _exact_key
+from .mapping import _as_stored
+from .query import _Predicates
 from .query import _root_search
 from .query import _search
 from .query import _with_ids
@@ -278,7 +279,7 @@ class DjangoStorage(ScimStorage):
         """Store a new resource, and return it as stored."""
         mapping = self._mapping(resource_type)
         with transaction.atomic(using=self.using):
-            _check_storable(mapping, resource, None)
+            check_storable(mapping, resource, None)
             self._check_uniqueness(mapping, resource, None)
             links = self._links(mapping, resource)
             record = mapping.record()
@@ -310,7 +311,7 @@ class DjangoStorage(ScimStorage):
             record = self._load(resource_type, resource.id, locked=True)
             stored = self._to_scim(resource_type, record)
             self._check_version(stored, expected_version)
-            _check_storable(mapping, resource, stored)
+            check_storable(mapping, resource, stored)
             self._check_uniqueness(mapping, resource, stored)
             links = self._links(mapping, resource)
             self._count_write(mapping, record)
@@ -543,7 +544,7 @@ class DjangoStorage(ScimStorage):
         mapping: ResourceMapping,
         resource: Resource[Any],
         record: Any,
-        links: dict[_Collection, list[Any]],
+        links: dict[Collection, list[Any]],
         now: Any,
         stored: Resource[Any] | None,
     ) -> None:
@@ -598,25 +599,32 @@ class DjangoStorage(ScimStorage):
                 if stored is None
                 else Path(column.binding.urn).get(stored, strict=False)
             )
-            if value is None or _comparable(value) == _comparable(current):
+            if value is None or comparable(value) == comparable(current):
                 continue
 
-            condition = _compare(comparator, column, CompareOperator.eq, value)
+            condition = compare(
+                mapping,
+                _Predicates(comparator),
+                self._policy,
+                column,
+                CompareOperator.eq,
+                value,
+            )
             if others.filter(condition).exists():
                 raise UniquenessException
 
     def _links(
         self, mapping: ResourceMapping, resource: Resource[Any]
-    ) -> dict[_Collection, list[Any]]:
+    ) -> dict[Collection, list[Any]]:
         """Return the records each Link of a resource links to, refusing a value that links to nothing."""
-        links: dict[_Collection, list[Any]] = {}
-        for collections, entries in _link_entries(mapping, resource):
+        links: dict[Collection, list[Any]] = {}
+        for collections, entries in link_entries(mapping, resource):
             ids = [entry.value for entry in entries]
             found = [
                 (collection, self._linked_records(collection, ids))
                 for collection in collections
             ]
-            links |= self._assign_links(found, entries)
+            links |= assign_links(found, entries, self._policy)
 
         for collection in mapping._all_collections():
             if not collection.owned:
@@ -624,73 +632,17 @@ class DjangoStorage(ScimStorage):
 
         return links
 
-    def _linked_records(self, collection: _Collection, ids: list[str]) -> list[Any]:
+    def _linked_records(self, collection: Collection, ids: list[str]) -> list[Any]:
         """Return the records of a Link holding one of the identifiers."""
-        target = collection.target
-        assert target is not None
+        target = cast(ResourceMapping, collection.target)
+        target_id = target._id
         records = target.record._default_manager.using(self.using).filter(
-            _with_ids(target._id, ids, self._comparator())
+            _with_ids(target_id, ids, self._comparator())
         )
-        if target._id.transformed:
-            records = records.annotate(**{target._id.key: target._id.expression})
+        if target_id.transformed:
+            records = records.annotate(**{target_id.key: target_id.expression})
 
         return list(records)
-
-    def _assign_links(
-        self, found: list[tuple[_Collection, list[Any]]], entries: list[Any]
-    ) -> dict[_Collection, list[Any]]:
-        """Give each entry of an attribute the record it links to, in the collection of the first Link holding that record.
-
-        found holds the records each Link of the attribute holds among the
-        values of the entries. An entry with a type links to a Link giving
-        the same type.
-        """
-        links: dict[_Collection, list[Any]] = {
-            collection: [] for collection, _ in found
-        }
-        urn = found[0][0].binding.urn
-        for entry in entries:
-            matches = [
-                (collection, record)
-                for collection, records in found
-                for record in records
-                if _holds_id(collection, record, entry.value)
-            ]
-            if not matches:
-                raise InvalidValueException(
-                    detail=f"'{urn}' links to an unknown resource"
-                )
-
-            entry_type = getattr(entry, "type", None)
-            if entry_type is not None:
-                matches = [
-                    (collection, record)
-                    for collection, record in matches
-                    if self._same_type(collection, entry_type)
-                ]
-
-            if not matches:
-                raise InvalidValueException(
-                    detail=f"'{urn}' links to {entry.value!r}, which is not "
-                    f"of type {entry_type!r}"
-                )
-
-            collection, record = matches[0]
-            if record not in links[collection]:
-                links[collection].append(record)
-
-        return links
-
-    def _same_type(self, collection: _Collection, value: str) -> bool:
-        """Tell whether a type is the one a Link gives, compared as filters compare it."""
-        binding = collection.type_column.binding  # type: ignore[union-attr]
-        try:
-            return bool(
-                binding.comparable(value, self._policy)
-                == binding.comparable(collection.link_type, self._policy)
-            )
-        except ValueError:
-            return False
 
 
 def _is_duplicate(error: IntegrityError) -> bool:
@@ -730,16 +682,3 @@ def _referenced() -> ConflictException:
     return ConflictException(
         detail="Another record refers to this resource, or it refers to a missing one"
     )
-
-
-def _holds_id(collection: _Collection, record: Any, value: str) -> bool:
-    """Tell whether a record a Link links to has an identifier.
-
-    A record holds the expression of a transformed identifier, which gives
-    the identifier clients read.
-    """
-    target_id = collection.target._id  # type: ignore[union-attr]
-    if target_id.transformed:
-        return bool(getattr(record, target_id.key) == value)
-
-    return bool(getattr(record, target_id.key) == _exact_key(target_id, value))

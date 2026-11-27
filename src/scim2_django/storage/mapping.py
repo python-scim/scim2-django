@@ -1,27 +1,25 @@
-import operator
+import base64
+import datetime
 import weakref
 from collections.abc import Callable
 from collections.abc import Generator
 from collections.abc import Iterable
-from collections.abc import Iterator
 from collections.abc import Mapping
 from dataclasses import dataclass
-from dataclasses import field as dataclass_field
-from dataclasses import replace
 from enum import Enum
-from functools import reduce
-from inspect import isclass
 from typing import Any
 
 from django.apps import apps
+from django.conf import settings
 from django.core import checks
 from django.core.exceptions import FieldDoesNotExist
 from django.core.exceptions import FieldError
 from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ValidationError
 from django.db import DEFAULT_DB_ALIAS
 from django.db import models
 from django.db.models import CASCADE
-from django.db.models import Case
 from django.db.models import Exists
 from django.db.models import F
 from django.db.models import ForeignObjectRel
@@ -30,25 +28,21 @@ from django.db.models import OuterRef
 from django.db.models import Prefetch
 from django.db.models import Q
 from django.db.models import Value
-from django.db.models import When
 from django.db.models.functions import Cast
 from django.db.models.functions import Concat
 from django.db.models.functions import NullIf
 from django.db.models.functions import Substr
-from django.db.models.lookups import IsNull
 from django.urls import get_resolver
-from pydantic import BaseModel
-from scim2_models import Attribute as SchemaAttribute
 from scim2_models import AttributeBinding
-from scim2_models import Extension
 from scim2_models import Mutability
-from scim2_models import Path
-from scim2_models import Required
 from scim2_models import Resource
-from scim2_models import ResponseParameters
-from scim2_models import Returned
 from scim2_models import Schema
-from scim2_models import Uniqueness
+from scim2_server import mapping as core
+from scim2_server.mapping import MappingProblem
+from scim2_server.mapping.declaration import key as _key
+from scim2_server.mapping.declaration import mutabilities as _mutabilities
+from scim2_server.mapping.declaration import never_returned as _never_returned
+from scim2_server.mapping.mapping import Problems
 
 _MAPPINGS: "weakref.WeakSet[ResourceMapping]" = weakref.WeakSet()
 """The mappings created so far, which the system check validates."""
@@ -56,6 +50,15 @@ _MAPPINGS: "weakref.WeakSet[ResourceMapping]" = weakref.WeakSet()
 _TEXT_FIELDS = (models.CharField, models.TextField)
 
 _UUID_PARTS = ((1, 8), (9, 4), (13, 4), (17, 4), (21, 12))
+
+_CHECK_IDS = {
+    "hidden-in-entries": "scim2_django.E007",
+    "read-only-in-entries": "scim2_django.E007",
+    "entry-fields": "scim2_django.E007",
+    "single-link-null": "scim2_django.E003",
+    "unwritten": "scim2_django.W002",
+}
+"""The identifiers of the system checks, by code of the problems of the mapping core."""
 
 
 class _UUIDText(Func):
@@ -85,27 +88,7 @@ class _UUIDText(Func):
         return compiler.compile(text.resolve_expression(compiler.query))
 
 
-class _Storage(Enum):
-    """How a mapping stores an attribute.
-
-    A derived attribute is read from another resource, such as the display of
-    a member, so writing it changes nothing. A ref is the $ref of a link,
-    built from its value: clients may send it, and writing it changes nothing
-    either. A link type is the type a Link gives its entries: clients may send
-    it, and the storage checks it against the linked resource. A constant is a
-    sub-attribute an Entry gives its entry: clients may send it, and the
-    storage checks it against the constant.
-    """
-
-    written = "written"
-    read_only = "read only"
-    derived = "derived"
-    ref = "ref"
-    link_type = "link type"
-    constant = "constant"
-
-
-class Attribute:
+class Attribute(core.Attribute):
     """A field holding a SCIM attribute that the storage only reads.
 
     The storage reads every attribute, a write-only one included, such as a
@@ -118,8 +101,12 @@ class Attribute:
     """
 
     def __init__(self, field: str, *, writable: bool = True) -> None:
-        self.field = field
-        self.writable = writable
+        super().__init__(field, writable=writable)
+
+    @property
+    def field(self) -> str:
+        """The name of the field holding the value."""
+        return str(self.target)
 
 
 class Computed:
@@ -185,7 +172,7 @@ class Transformed:
         self.to_field = to_field
 
 
-class Many:
+class Many(core.Many):
     """The entries of a multi-valued attribute, stored in the records of another model.
 
     The entries belong to the resource: writing the resource replaces them.
@@ -206,11 +193,10 @@ class Many:
     """
 
     def __init__(self, relation: str, attributes: Mapping[str, Any] | Any) -> None:
-        self.relation = relation
-        self.attributes = attributes
+        super().__init__(relation, attributes)
 
 
-class Entry:
+class Entry(core.Entry):
     """A multi-valued complex attribute holding one entry at most, stored in fields of the resource model.
 
     Such as the email address of a user, in its ``email`` field. The
@@ -229,22 +215,8 @@ class Entry:
         one back. Without it, the storage does not store ``primary``.
     """
 
-    def __init__(
-        self,
-        attributes: Mapping[str, str | Attribute],
-        *,
-        type: str | None = None,
-        primary: bool | None = None,
-    ) -> None:
-        self.attributes = attributes
-        self.constants = {
-            name: value
-            for name, value in (("type", type), ("primary", primary))
-            if value is not None
-        }
 
-
-class Link:
+class Link(core.Link):
     """A complex attribute linking to other resources.
 
     A multi-valued attribute, such as the ``members`` of a group, maps to a
@@ -276,23 +248,13 @@ class Link:
         Without it, the storage does not store ``type``.
     """
 
-    def __init__(
-        self, relation: str, resource_type: str, *, type: str | None = None
-    ) -> None:
-        self.relation = relation
-        self.resource_type = resource_type
-        self.type = type
-
 
 @dataclass(eq=False)
-class _Column:
+class _Column(core.Column):
     """A SCIM attribute stored in a field, or computed by an expression.
 
     key is the name of the field, or the alias the expression is annotated
-    under. textual tells whether filters compare the field as text, as they do
-    for an integer identifier. keyed tells whether filters find an
-    identifier by the value of its field, so that the database uses its
-    index. relation is the reverse one-to-one relation leading to the record
+    under. relation is the reverse one-to-one relation leading to the record
     holding the field, when the field is not one of the resource record, as in
     "scim__external_id".
 
@@ -300,17 +262,11 @@ class _Column:
     written through to_field, under field_key.
     """
 
-    binding: AttributeBinding
-    key: str
-    writable: bool
     field: "models.Field[Any, Any] | None" = None
     expression: Any = None
-    textual: bool = False
     relation: Any = None
     to_field: Callable[[Any], Any] | None = None
     path: str | None = None
-    keyed: bool = False
-    in_entry: bool = False
 
     @property
     def field_key(self) -> str:
@@ -321,83 +277,6 @@ class _Column:
     def transformed(self) -> bool:
         """Whether the field holds the values in another form than clients read and send."""
         return self.path is not None
-
-    @property
-    def is_string(self) -> bool:
-        """Whether the attribute is a SCIM string. A binary value is not one."""
-        target = self.binding.target_type
-        return (
-            target is not None
-            and target is not bytes
-            and SchemaAttribute.Type.from_python(target) == SchemaAttribute.Type.string
-        )
-
-    @property
-    def concealed(self) -> bool:
-        """Whether clients never read the value: the server never returns it, as for a write-only value.
-
-        Filters and sorts cannot compare it.
-        """
-        return _never_returned(self.binding) or Mutability.write_only in _mutabilities(
-            self.binding
-        )
-
-    @property
-    def empty_string(self) -> bool:
-        """Whether the field holds an empty string for no value.
-
-        Django text fields without null do so. A transformed field holds what
-        to_field gives for no value.
-        """
-        return (
-            self.is_string
-            and self.field is not None
-            and not self.field.null
-            and not self.transformed
-        )
-
-    @property
-    def nullable(self) -> bool:
-        """Whether the field can hold no value.
-
-        An expression is taken as nullable, and so is a transformed field,
-        which holds what to_field gives for no value.
-        """
-        return (
-            self.field is None
-            or self.transformed
-            or bool(self.field.null)
-            or self.empty_string
-        )
-
-    @property
-    def required(self) -> bool:
-        """Whether a new record needs a value.
-
-        It does when the field cannot be null, and gets no value from a default
-        or from Django, as a date with auto_now does. A field of a related
-        record needs none, as the related record may not exist.
-        """
-        if self.field is None or self.nullable or self.relation is not None:
-            return False
-
-        return _field_needs_value(self.field)
-
-    @property
-    def enumeration(self) -> list[Any] | None:
-        """The values a field with choices stores, or None for a field without choices.
-
-        A transformed field stores other values than clients send.
-        """
-        if self.field is None or self.transformed or not self.field.choices:
-            return None
-
-        return [value for value, _ in self.field.flatchoices]
-
-    @property
-    def casefolded(self) -> bool:
-        """Whether the values compare without their case."""
-        return self.is_string and not self.binding.case_exact
 
     @property
     def compared(self) -> Any:
@@ -418,49 +297,47 @@ class _Column:
 
         return expression
 
+    def fill(self, in_record: bool) -> None:
+        """Fill the facts of the storage the mapping core reads, from the field.
+
+        A text field without null holds an empty string for no value. An
+        expression is taken as nullable, and so is a transformed field, which
+        holds what to_field gives for no value. A field of a related record
+        needs no value, as the related record may not exist. A transformed
+        field stores other values than clients send.
+        """
+        field = self.field
+        self.related = self.relation is not None
+        self.empty_string = (
+            self.is_string
+            and field is not None
+            and not field.null
+            and not self.transformed
+        )
+        self.nullable = (
+            field is None or self.transformed or bool(field.null) or self.empty_string
+        )
+        self.needs_value = field is not None and _field_needs_value(field)
+        self.fills_none = self.transformed
+        if field is not None and not self.transformed and field.choices:
+            self.enumeration = [value for value, _ in field.flatchoices]
+
+        if in_record and field is not None and self.relation is None:
+            self.stores = field.name
+
 
 @dataclass(eq=False)
-class _Collection:
+class _Collection(core.Collection):
     """A multi-valued attribute, or a complex one, stored in related records.
 
-    The entries of an owned collection belong to the resource. The others are
-    links to the resources of another mapping, the target. A single collection
-    holds one entry at most, such as the manager of a user. A simple
-    collection holds the values of a multi-valued simple attribute, in the
-    column it keeps under None.
-
-    link_type is the type a Link gives its entries, and type_column the
-    constant filters compare it as.
+    relation is the Django relation from the resource model to the entries.
     """
-
-    binding: AttributeBinding
-    relation: "models.Field[Any, Any] | ForeignObjectRel"
-    columns: dict[str | None, _Column] = dataclass_field(default_factory=dict)
-    resource_type: str | None = None
-    target: "ResourceMapping | None" = None
-    link_type: str | None = None
-    type_column: _Column | None = None
-
-    @property
-    def owned(self) -> bool:
-        """Whether the entries belong to the resource, rather than link to other resources."""
-        return self.resource_type is None
 
     @property
     def entry_model(self) -> type[models.Model]:
         """The model of the entries."""
-        model: type[models.Model] = self.relation.related_model  # type: ignore[assignment]
+        model: type[models.Model] = self.relation.related_model
         return model
-
-    @property
-    def single(self) -> bool:
-        """Whether the collection holds one entry at most."""
-        return not self.binding.is_multivalued
-
-    @property
-    def simple(self) -> bool:
-        """Whether the collection holds the values of a multi-valued simple attribute."""
-        return None in self.columns
 
     @property
     def accessor(self) -> str:
@@ -468,17 +345,7 @@ class _Collection:
         if isinstance(self.relation, ForeignObjectRel):
             return str(self.relation.get_accessor_name())
 
-        return self.relation.name
-
-    def column(self, sub_field_name: str | None) -> _Column | None:
-        """Return the column of a sub-attribute, or of the values of a simple collection named alone.
-
-        A complex collection named alone has no column.
-        """
-        if sub_field_name == "type" and self.type_column is not None:
-            return self.type_column
-
-        return self.columns.get(sub_field_name)
+        return str(self.relation.name)
 
     def entries(self) -> "models.QuerySet[Any]":
         """Return the entries of the record of the outer query."""
@@ -520,62 +387,17 @@ class _Collection:
     def prefetch(self) -> "Prefetch[Any]":
         """Return how to load the entries along with the records, in the order they are read."""
         entries = self.entry_model._default_manager.order_by(*self.order())
-        if self.target is not None:
-            entries = entries.annotate(**self.target._annotations())
-            related = self.target._related_names()
+        target: Any = self.target
+        if target is not None:
+            entries = entries.annotate(**target._annotations())
+            related = target._related_names()
             if related:
                 entries = entries.select_related(*related)
 
         return Prefetch(self.accessor, queryset=entries)
 
-    @property
-    def writable(self) -> bool:
-        """Whether writing the resource writes these entries.
 
-        Entries of which no sub-attribute is written are left as they are.
-        """
-        if self.owned and not any(column.writable for column in self.columns.values()):
-            return False
-
-        mutability = self.binding.model.get_field_annotation(
-            self.binding.field_name, Mutability
-        )
-        return bool(mutability != Mutability.read_only)
-
-
-@dataclass(eq=False)
-class _Entry:
-    """A multi-valued complex attribute holding one entry at most, in fields of the resource record.
-
-    columns holds the columns of the mapped sub-attributes, and constants the
-    columns of the sub-attributes the entry always has, by sub-attribute
-    name. A constant column has no value when the entry does not exist.
-    """
-
-    binding: AttributeBinding
-    columns: dict[str, _Column]
-    constants: dict[str, tuple[Any, _Column]]
-    simple = False
-
-    @property
-    def writable(self) -> bool:
-        """Whether writing the resource writes the entry: its fields are all written, or all read-only."""
-        return any(column.writable for column in self.columns.values())
-
-    @property
-    def present(self) -> Q:
-        """The condition that the record has the entry: one of its sub-attributes has a value."""
-        return reduce(
-            operator.or_,
-            (Q(IsNull(column.compared, False)) for column in self.columns.values()),
-        )
-
-    def exists(self, condition: Q) -> Q:
-        """Return the condition that the entry exists and matches condition."""
-        return self.present & condition
-
-
-class ResourceMapping:
+class ResourceMapping(core.ResourceMapping):
     """How the resources of a SCIM model are stored in the records of a Django model.
 
     The paths are checked against the SCIM model when the mapping is created,
@@ -613,9 +435,17 @@ class ResourceMapping:
         value does not fit the attribute of its path.
     """
 
-    _REQUIRED = ("id",)
+    configuration_error = ImproperlyConfigured
+
+    record: type[models.Model]
+
     _FIELDS = ("id", "meta.created", "meta.lastModified")
     """The attributes the storage fills itself, which a field holds as it is."""
+
+    version: str | None
+    _id: _Column
+    _created: _Column | None
+    _last_modified: _Column | None
 
     def __init__(
         self,
@@ -625,32 +455,8 @@ class ResourceMapping:
         *,
         version: str | None = None,
     ) -> None:
-        self.model = model
-        self.record = record
-        self.version = version
-        self._declared: dict[str, tuple[AttributeBinding, Any]] = {}
         self._messages: list[checks.CheckMessage] | None = None
-        self._columns: dict[tuple[type[BaseModel], str, str | None], _Column] = {}
-        self._collections: dict[tuple[type[BaseModel], str], list[_Collection]] = {}
-        self._entries: dict[tuple[type[BaseModel], str], _Entry] = {}
-
-        declared: dict[tuple[Any, ...], str] = {}
-        for path, value in attributes.items():
-            binding = self._resolve(path)
-            key = _key(binding)
-            for other, other_path in declared.items():
-                if _overlap(key, other):
-                    raise ValueError(
-                        f"{other_path!r} and {path!r} map the same attribute"
-                    )
-
-            declared[key] = path
-            self._declare(path, binding, value)
-
-        for required in self._REQUIRED:
-            if _key(self._resolve(required)) not in declared:
-                raise ValueError(f"The mapping of {model.__name__} needs {required!r}")
-
+        super().__init__(model, record, attributes, version=version)
         _MAPPINGS.add(self)
 
     def __repr__(self) -> str:
@@ -687,8 +493,7 @@ class ResourceMapping:
             not fit its attribute.
         """
         self._ready()
-        models_: list[Any] = [self.model, *self.model.get_extension_models().values()]
-        return [self._restrict(model.to_schema()) for model in models_]
+        return super().schemas()
 
     def check(self) -> list[checks.CheckMessage]:
         """Return the errors and the warnings of the fields of the mapping.
@@ -697,13 +502,17 @@ class ResourceMapping:
         """
         apps.check_models_ready()
         if self._messages is None:
-            messages = list(self._resolve_fields())
-            if not any(message.is_serious() for message in messages):
-                messages.extend(self._check_unwritten())
-
-            self._messages = messages
+            self._messages = [self._message(problem) for problem in self._resolve()]
 
         return self._messages
+
+    def _message(self, problem: MappingProblem) -> checks.CheckMessage:
+        """Return the system check message of a problem of the mapping."""
+        id = _CHECK_IDS.get(problem.code, problem.code)
+        if problem.level == "warning":
+            return checks.Warning(problem.message, obj=self, id=id)
+
+        return checks.Error(problem.message, obj=self, id=id)
 
     def _ready(self) -> None:
         """Resolve the fields, raising when one does not fit its attribute."""
@@ -713,329 +522,8 @@ class ResourceMapping:
                 "\n".join(f"{self!r}: {error.msg}" for error in errors)
             )
 
-    def _restrict(self, schema: Schema) -> Schema:
-        """Return a schema with the attributes the mapping stores only."""
-        attributes = []
-        for attribute in schema.attributes or []:
-            restricted = self._restrict_attribute(
-                f"{schema.id}:{attribute.name}", attribute
-            )
-            if restricted is not None:
-                attributes.append(restricted)
-
-        return schema.model_copy(update={"attributes": attributes})
-
-    def _restrict_attribute(self, urn: str, attribute: Any) -> Any:
-        """Return an attribute of a schema as the mapping stores it, or None when it stores nothing of it.
-
-        An attribute never returned is optional, since clients cannot send
-        back a value they never read.
-        """
-        if attribute.sub_attributes:
-            restricted = self._restrict_complex(urn, attribute)
-        else:
-            restricted = self._restrict_simple(urn, attribute)
-
-        if restricted is None or not (
-            restricted.returned == Returned.never
-            or restricted.mutability == Mutability.write_only
-        ):
-            return restricted
-
-        return restricted.model_copy(update={"required": Required.false})
-
-    def _restrict_simple(self, urn: str, attribute: Any) -> Any:
-        """Return a simple attribute of a schema as the mapping stores it, or None when it stores nothing of it.
-
-        A single attribute whose field needs a value is required.
-        """
-        storage = self._storage(urn)
-        if storage is None:
-            return None
-
-        if storage == _Storage.link_type:
-            return attribute
-
-        if storage == _Storage.written:
-            if attribute.multi_valued or not self._needs_value(urn):
-                return attribute
-
-            return attribute.model_copy(update={"required": Required.true})
-
-        if storage == _Storage.constant:
-            constant = self._constant_value(urn)
-            if not attribute.canonical_values:
-                return attribute
-
-            return attribute.model_copy(update={"canonical_values": [constant]})
-
-        if storage == _Storage.ref:
-            linked = self._linked_resource_types(urn)
-            return attribute.model_copy(update={"reference_types": linked})
-
-        return attribute.model_copy(update={"mutability": Mutability.read_only})
-
-    def _restrict_complex(self, urn: str, attribute: Any) -> Any:
-        """Return a complex attribute with the sub-attributes the mapping stores, or None when it stores none.
-
-        A single complex attribute is required when the field of one of its
-        sub-attributes needs a value, since the storage refuses a resource
-        without it. A complex attribute whose sub-attributes are all never
-        returned is never returned either.
-        """
-        sub_attributes = [
-            restricted
-            for sub_attribute in attribute.sub_attributes
-            if (
-                restricted := self._restrict_attribute(
-                    f"{urn}.{sub_attribute.name}", sub_attribute
-                )
-            )
-            is not None
-        ]
-        if not sub_attributes:
-            return None
-
-        written = any(
-            sub_attribute.mutability != Mutability.read_only
-            for sub_attribute in sub_attributes
-        )
-        update: dict[str, Any] = {
-            "sub_attributes": sub_attributes,
-            "mutability": attribute.mutability if written else Mutability.read_only,
-        }
-        if all(
-            sub_attribute.returned == Returned.never for sub_attribute in sub_attributes
-        ):
-            update["returned"] = Returned.never
-            if attribute.mutability == Mutability.read_write:
-                update["mutability"] = Mutability.write_only
-
-        if not attribute.multi_valued and any(
-            self._needs_value(f"{urn}.{sub_attribute.name}")
-            for sub_attribute in sub_attributes
-        ):
-            update["required"] = Required.true
-
-        return attribute.model_copy(update=update)
-
-    def _storage(self, urn: str) -> _Storage | None:
-        """Return how the mapping stores the attribute of a URN, or None when it does not store it."""
-        key = urn.lower()
-        for column in self._columns.values():
-            if column.binding.urn.lower() == key:
-                return _column_storage(column)
-
-        for collection in self._all_collections():
-            if collection.owned:
-                for column in collection.columns.values():
-                    if column.binding.urn.lower() == key:
-                        return _column_storage(column)
-
-                continue
-
-            head = collection.binding.urn.lower()
-            if key == f"{head}.value":
-                return _Storage.written
-
-            if key in (f"{head}.display", f"{head}.displayname"):
-                return _Storage.derived
-
-            if key == f"{head}.$ref":
-                return _Storage.ref
-
-            if key == f"{head}.type" and collection.link_type is not None:
-                return _Storage.link_type
-
-        for entry in self._entries.values():
-            for _, column in entry.constants.values():
-                if column.binding.urn.lower() != key:
-                    continue
-
-                if entry.writable:
-                    return _Storage.constant
-
-                return _Storage.read_only
-
-        return None
-
-    def _constant_value(self, urn: str) -> Any:
-        """Return the constant an Entry gives the sub-attribute of a URN."""
-        key = urn.lower()
-        return next(
-            constant
-            for entry in self._entries.values()
-            for constant, column in entry.constants.values()
-            if column.binding.urn.lower() == key
-        )
-
-    def _linked_resource_types(self, urn: str) -> list[str]:
-        """Return the resource types the Links of an attribute link to, from the URN of its $ref."""
-        head = urn.lower().removesuffix(".$ref")
-        return [
-            collection.resource_type
-            for collection in self._all_collections()
-            if collection.binding.urn.lower() == head
-            and collection.resource_type is not None
-        ]
-
-    def _all_collections(self) -> Iterator[_Collection]:
-        """Yield the collections of every attribute, each Link of an attribute being a collection."""
-        for collections in self._collections.values():
-            yield from collections
-
-    def _column(self, path: str) -> _Column:
-        """Return the column of the attribute at a path."""
-        return self._columns[_key(self._resolve(path))]
-
-    def _lookup(
-        self, binding: AttributeBinding
-    ) -> list[tuple[_Collection | None, _Column | None]]:
-        """Return each collection holding an attribute, if any, with the column of the attribute in it.
-
-        An attribute outside collections gives one pair, without collection.
-        An attribute linking to several resource types gives a pair for each
-        of its Links. The column is None for an attribute stored nowhere, and
-        for a collection named alone, such as emails.
-        """
-        collections = self._collections.get((binding.model, binding.field_name))
-        if collections is None:
-            return [(None, self._columns.get(_key(binding)) or self._constant(binding))]
-
-        return [
-            (collection, collection.column(binding.sub_field_name))
-            for collection in collections
-        ]
-
-    def _constant(self, binding: AttributeBinding) -> _Column | None:
-        """Return the column of a sub-attribute an Entry gives its entry, or None."""
-        entry = self._entries.get((binding.model, binding.field_name))
-        if entry is None or binding.sub_field_name not in entry.constants:
-            return None
-
-        _, column = entry.constants[binding.sub_field_name]
-        return column
-
-    def _nullable(self, urn: str) -> bool:
-        """Tell whether the field of an attribute can hold no value, True for an attribute without field."""
-        key = urn.lower()
-        return all(
-            column.nullable
-            for column in self._columns.values()
-            if column.binding.urn.lower() == key
-        )
-
-    def _required(self, urn: str) -> bool:
-        """Tell whether a new record needs a value for the attribute of a URN."""
-        return any(self._required_columns(urn))
-
-    def _needs_value(self, urn: str) -> bool:
-        """Tell whether clients must give a value for the attribute of a URN, in a resource or in an entry of a Many.
-
-        An attribute never returned needs none, since clients never read it
-        back before a replacement.
-        """
-        return any(
-            column.writable and not column.concealed
-            for column in self._required_columns(urn, entries=True)
-        )
-
-    def _required_columns(
-        self, urn: str, *, entries: bool = False
-    ) -> Iterator[_Column]:
-        """Yield the columns of the attribute of a URN that need a value in a new record.
-
-        With entries, also yield those of the entries of a Many.
-        """
-        key = urn.lower()
-        columns: Iterable[_Column] = self._columns.values()
-        if entries:
-            columns = [
-                *columns,
-                *(
-                    column
-                    for collection in self._all_collections()
-                    if collection.owned
-                    for column in collection.columns.values()
-                ),
-            ]
-
-        for column in columns:
-            if column.required and column.binding.urn.lower() == key:
-                yield column
-
-    def _sub_columns(self, binding: AttributeBinding) -> list[_Column]:
-        """Return the mapped sub-attributes of a complex attribute holding a single value."""
-        return [
-            column
-            for (model, field_name, sub_field_name), column in self._columns.items()
-            if model is binding.model
-            and field_name == binding.field_name
-            and sub_field_name is not None
-        ]
-
-    def _string_columns(self) -> Iterator[_Column]:
-        """Yield the columns holding strings, those of the collections included."""
-        for column in self._columns.values():
-            if column.is_string:
-                yield column
-
-        for entry in self._entries.values():
-            for _, column in entry.constants.values():
-                if column.is_string:
-                    yield column
-
-        for collection in self._all_collections():
-            for column in collection.columns.values():
-                if column.is_string:
-                    yield column
-
-            if collection.type_column is not None:
-                yield collection.type_column
-
-    def _unique_columns(self) -> Iterator[_Column]:
-        """Yield the written columns clients read, whose values no two resources share.
-
-        A column never written, such as id, cannot get a value another
-        resource holds. A column hidden from clients is left out, so that an
-        error tells nothing about the values of other resources. A column of an
-        entry is left out, as a resource holds its values in a list.
-        """
-        for column in self._columns.values():
-            if column.concealed or not column.writable or column.in_entry:
-                continue
-
-            if column.binding.get_annotation(Uniqueness) in (
-                Uniqueness.server,
-                Uniqueness.global_,
-            ):
-                yield column
-
-    def _returned_collections(
-        self, parameters: ResponseParameters[Any] | None = None
-    ) -> list[_Collection]:
-        """Return the collections a response keeps, all of them without parameters.
-
-        Without a version field, the version is a hash of the whole resource,
-        so every collection is kept.
-        """
-        collections = list(self._all_collections())
-        if parameters is None or self.version is None:
-            return collections
-
-        paths = Path[self.model].iter_paths(  # type: ignore[name-defined]
-            include_subattributes=False,
-            attributes=parameters.attributes,
-            excluded_attributes=parameters.excluded_attributes,
-        )
-        bindings = (path.resolve() for path in paths)
-        kept = {binding.urn for binding in bindings if binding is not None}
-        return [
-            collection for collection in collections if collection.binding.urn in kept
-        ]
-
     def _queryset(
-        self, collections: Iterable[_Collection], using: str = DEFAULT_DB_ALIAS
+        self, collections: Iterable[core.Collection], using: str = DEFAULT_DB_ALIAS
     ) -> "models.QuerySet[Any]":
         """Return the records of a database with their computed attributes, and the given collections loaded along."""
         records = self.record._default_manager.using(using)
@@ -1044,416 +532,146 @@ class ResourceMapping:
             records = records.select_related(*related)
 
         return records.annotate(**self._annotations()).prefetch_related(
-            *(collection.prefetch() for collection in collections)
+            *(collection.prefetch() for collection in collections)  # type: ignore[attr-defined]
         )
 
     def _annotations(self) -> dict[str, Any]:
         """Return the expressions of the computed attributes, by the alias records hold them under."""
         return {
-            column.key: column.expression
+            column.key: column.expression  # type: ignore[attr-defined]
             for column in self._columns.values()
-            if column.expression is not None
+            if column.expression is not None  # type: ignore[attr-defined]
         }
 
     def _targets(
-        self, mappings: Mapping[str, "ResourceMapping"]
-    ) -> list[tuple[_Collection, "ResourceMapping"]]:
+        self, mappings: Mapping[str, core.ResourceMapping]
+    ) -> list[tuple[core.Collection, core.ResourceMapping]]:
         """Return each Link with the mapping of the resources it links to.
 
         Several storages may share a mapping, as long as they link it to the
         same mappings.
         """
         self._ready()
-        return [
-            (collection, self._target(collection, mappings))
-            for collection in self._all_collections()
-            if not collection.owned
-        ]
+        return super()._targets(mappings)
 
-    def _bind(self, links: list[tuple[_Collection, "ResourceMapping"]]) -> None:
-        """Bind each Link to the mapping :meth:`_targets` returned for it.
+    def _relations(self) -> list[Any]:
+        """Return the relations leading to the records holding mapped fields, by name."""
+        relations = {
+            column.relation.name: column.relation  # type: ignore[attr-defined]
+            for column in self._columns.values()
+            if column.relation is not None  # type: ignore[attr-defined]
+        }
+        return [relations[name] for name in sorted(relations)]
 
-        A storage gets the targets of every mapping before binding any, so
-        that a refused mapping binds nothing.
+    def _related_names(self) -> list[str]:
+        """Return the names select_related takes for the relations leading to the records holding mapped fields."""
+        return [relation.name for relation in self._relations()]
+
+    def _is_target(self, value: Any) -> bool:
+        return isinstance(value, str | Computed | Transformed)
+
+    def _value_writable(self, value: Any) -> bool:
+        if isinstance(value, Computed):
+            return False
+
+        if isinstance(value, Transformed):
+            return value.to_field is not None
+
+        return super()._value_writable(value)
+
+    def _check_declared(
+        self,
+        path: str,
+        binding: AttributeBinding,
+        value: Any,
+        holder: core.Many | core.Entry | None,
+    ) -> None:
+        """Refuse a value Django cannot map where it is declared.
+
+        The entries of another model can be neither computed nor transformed.
+        An Entry maps fields of the resource model. The attributes the storage
+        fills itself map fields, but id may be transformed. Clients read the
+        value of a Transformed through its expression.
         """
-        for collection, target in links:
-            collection.target = target
-            collection.columns = {}
-            head = collection.binding.urn
-            for binding, column in (
-                (self._resolve(f"{head}.value"), target._id),
-                (
-                    self._find(f"{head}.display") or self._find(f"{head}.displayName"),
-                    target._display(),
-                ),
-            ):
-                if binding is None or column is None:
-                    continue
-
-                collection.columns[binding.sub_field_name] = replace(
-                    column, binding=binding, writable=False
-                )
-
-    def _target(
-        self, collection: _Collection, mappings: Mapping[str, "ResourceMapping"]
-    ) -> "ResourceMapping":
-        """Return the mapping a Link links to, refusing one that does not fit it."""
-        target = mappings.get(collection.resource_type)  # type: ignore[arg-type]
-        if target is None:
-            raise ImproperlyConfigured(
-                f"No mapping for the resource type {collection.resource_type!r}"
-            )
-
-        target._ready()
-        if collection.target is not None and collection.target is not target:
-            raise ImproperlyConfigured(
-                f"{collection.binding.urn!r} already links to another mapping "
-                f"of {collection.resource_type!r}: a mapping serves storages "
-                "sharing the same mappings"
-            )
-
-        if collection.entry_model is not target.record:
-            raise ImproperlyConfigured(
-                f"{collection.binding.urn!r} links to "
-                f"{collection.entry_model._meta.label} records, but the mapping "
-                f"of {collection.resource_type!r} holds "
-                f"{target.record._meta.label} records"
-            )
-
-        return target
-
-    def _display(self) -> _Column | None:
-        """Return the column a link to these resources displays."""
-        for path in ("displayName", "userName"):
-            binding = self._find(path)
-            if binding is None:
-                continue
-
-            column = self._columns.get(_key(binding))
-            if column is not None and not column.concealed:
-                return column
-
-        return None
-
-    def _find(self, path: str) -> AttributeBinding | None:
-        """Return the attribute at a path, or None if the model has none there."""
-        return Path[self.model](path).resolve()  # type: ignore[name-defined]
-
-    def _resolve(self, path: str) -> AttributeBinding:
-        """Return the attribute at a path, refusing a path the model does not know."""
-        binding = self._find(path)
-        if binding is None:
-            raise ValueError(f"{path!r} is not an attribute of {self.model.__name__}")
-
-        return binding
-
-    def _declare(self, path: str, binding: AttributeBinding, value: Any) -> None:
-        """Check that the value of a path fits the SCIM attribute, and keep it until the fields are resolved."""
-        target = binding.target_type
-        is_complex = isclass(target) and issubclass(target, BaseModel)
-
-        if isinstance(value, Many):
-            self._check_many(path, binding, value, is_complex)
-            self._declared[path] = (binding, value)
-            return
-
-        if isinstance(value, Entry):
-            self._check_entry(path, binding, value, is_complex)
-            self._declared[path] = (binding, value)
-            return
-
-        if isinstance(value, Link):
-            value = [value]
-
-        if isinstance(value, list) and all(isinstance(item, Link) for item in value):
-            if not is_complex or binding.sub_field_name is not None:
-                raise ValueError(
-                    f"{path!r} is not a complex attribute of {self.model.__name__}"
-                )
-
-            if not binding.is_multivalued and len(value) > 1:
-                raise ValueError(
-                    f"{path!r} holds one value, so it is mapped to one Link"
-                )
-
-            self._check_links(path, value)
-            self._declared[path] = (binding, value)
-            return
-
-        if binding.is_multivalued or is_complex:
+        if isinstance(holder, core.Many) and isinstance(value, Computed | Transformed):
             raise ValueError(
-                f"{path!r} holds several values or sub-attributes: map it with Many "
-                "or Link, or map its sub-attributes"
+                f"{path!r} is held by the entries of another model, "
+                "which cannot be computed nor transformed"
             )
 
-        self._check_value(path, binding)
-        self._check_field_value(path, value)
-        if _key(binding) == _key(self._resolve("id")) and isinstance(
-            value, Transformed
-        ):
+        if isinstance(holder, core.Entry):
+            if not isinstance(value, str | Attribute):
+                raise ValueError(
+                    f"{path!r} must be mapped to the name of a field, or an Attribute"
+                )
+
+            field = value if isinstance(value, str) else value.field
+            if "__" in field:
+                raise ValueError(
+                    f"{path!r} is held by a field of the resource model, not of a "
+                    "related model"
+                )
+
+        if holder is not None:
+            return
+
+        is_id = _key(binding) == _key(self._resolve_path("id"))
+        if is_id and isinstance(value, Transformed):
             if value.expression is None or value.to_field is None:
                 raise ValueError(
                     f"{path!r} is mapped to a Transformed, which needs an "
                     "expression and to_field"
                 )
 
-            self._declared[path] = (binding, value)
             return
 
-        fields = {_key(self._resolve(path)) for path in self._FIELDS}
+        fields = {_key(self._resolve_path(path)) for path in self._FIELDS}
         if _key(binding) in fields and not isinstance(value, str):
             raise ValueError(f"{path!r} must be mapped to the name of a field")
 
-        self._check_read_and_written(path, binding, value)
-        self._declared[path] = (binding, value)
-
-    def _check_read_and_written(
-        self, path: str, binding: AttributeBinding, value: Any
-    ) -> None:
-        """Refuse an attribute that clients could neither read nor write, or one they read that the storage would read as it is stored."""
-        mutabilities = _mutabilities(binding)
-        read = Mutability.write_only not in mutabilities and not _never_returned(
+        read = Mutability.write_only not in _mutabilities(
             binding
-        )
+        ) and not _never_returned(binding)
         if read and isinstance(value, Transformed) and value.expression is None:
             raise ValueError(
                 f"Clients read {path!r}, so its Transformed needs an expression, "
                 "unless its schema makes it write-only"
             )
 
-        written = Mutability.read_only not in mutabilities and not (
-            isinstance(value, Computed)
-            or (isinstance(value, Attribute) and not value.writable)
-            or (isinstance(value, Transformed) and value.to_field is None)
-        )
-        if not (read or written):
-            raise ValueError(f"Clients could neither read nor write {path!r}")
-
-    def _check_many(
-        self, path: str, binding: AttributeBinding, many: Many, is_complex: bool
-    ) -> None:
-        """Check that a Many fits a multi-valued attribute, and maps each sub-attribute once."""
-        simple = not isinstance(many.attributes, Mapping)
-        if (
-            binding.sub_field_name is not None
-            or not binding.is_multivalued
-            or is_complex == simple
-        ):
-            kind = "simple" if simple else "complex"
-            raise ValueError(
-                f"{path!r} is not a multi-valued {kind} attribute of "
-                f"{self.model.__name__}"
-            )
-
-        if simple:
-            self._check_entry_value(path, many.attributes)
-            return
-
-        entries: dict[tuple[Any, ...], str] = {}
-        for sub_path, sub_value in many.attributes.items():
-            sub_binding = self._resolve(f"{path}.{sub_path}")
-            if _key(sub_binding) in entries:
-                raise ValueError(
-                    f"{entries[_key(sub_binding)]!r} and "
-                    f"{f'{path}.{sub_path}'!r} map the same attribute"
-                )
-
-            entries[_key(sub_binding)] = f"{path}.{sub_path}"
-            self._check_value(f"{path}.{sub_path}", sub_binding)
-            self._check_entry_value(f"{path}.{sub_path}", sub_value)
-
-    def _check_entry(
-        self, path: str, binding: AttributeBinding, entry: Entry, is_complex: bool
-    ) -> None:
-        """Check that an Entry fits a multi-valued complex attribute, maps fields of the record, and gives constants to sub-attributes it does not map."""
-        if (
-            binding.sub_field_name is not None
-            or not binding.is_multivalued
-            or not is_complex
-        ):
-            raise ValueError(
-                f"{path!r} is not a multi-valued complex attribute of "
-                f"{self.model.__name__}"
-            )
-
-        if not entry.attributes:
-            raise ValueError(f"The Entry of {path!r} maps no sub-attribute")
-
-        mapped = set()
-        for sub_path, sub_value in entry.attributes.items():
-            sub_binding = self._resolve(f"{path}.{sub_path}")
-            self._check_value(f"{path}.{sub_path}", sub_binding)
-            if not isinstance(sub_value, str | Attribute):
-                raise ValueError(
-                    f"{f'{path}.{sub_path}'!r} must be mapped to the name of a "
-                    "field, or an Attribute"
-                )
-
-            field = sub_value if isinstance(sub_value, str) else sub_value.field
-            if "__" in field:
-                raise ValueError(
-                    f"{f'{path}.{sub_path}'!r} is held by a field of the resource "
-                    "model, not of a related model"
-                )
-
-            mapped.add(_key(sub_binding))
-
-        for name in entry.constants:
-            given = self._find(f"{path}.{name}")
-            if given is None or _key(given) in mapped:
-                raise ValueError(
-                    f"The Entry of {path!r} gives {name!r}, which is not a "
-                    "sub-attribute it leaves unmapped"
-                )
-
-    def _check_entry_value(self, path: str, value: Any) -> None:
-        """Refuse a value of an entry that is not the name of a field, or an Attribute."""
-        if isinstance(value, Computed | Transformed):
-            raise ValueError(
-                f"{path!r} is held by the entries of another model, "
-                "which cannot be computed nor transformed"
-            )
-
-        self._check_field_value(path, value)
-
-    def _check_field_value(self, path: str, value: Any) -> None:
-        """Refuse a value that is not the name of a field, an Attribute, a Computed, or a Transformed."""
-        if not isinstance(value, str | Attribute | Computed | Transformed):
-            raise ValueError(
-                f"{path!r} must be mapped to the name of a field, an Attribute, "
-                "a Computed, or a Transformed"
-            )
-
-    def _check_value(self, path: str, binding: AttributeBinding) -> None:
-        """Refuse a sub-attribute holding several values, which no field can hold."""
-        if binding.sub_field_name is not None and binding.target_is_multivalued:
-            raise ValueError(
-                f"{path!r} holds several values in a complex attribute, "
-                "which the storage cannot map"
-            )
-
-    def _check_links(self, path: str, links: list[Link]) -> None:
-        """Check that the Links of an attribute link to distinct resource types, and give a type all or none."""
-        resource_types = [link.resource_type for link in links]
-        if not links or len(set(resource_types)) != len(resource_types):
-            raise ValueError(
-                f"{path!r} needs one Link per resource type, and at least one"
-            )
-
-        typed = {link.type is not None for link in links}
-        if len(typed) > 1:
-            raise ValueError(f"Either every Link of {path!r} has a type, or none")
-
-        if typed == {True} and self._find(f"{path}.type") is None:
-            raise ValueError(f"{path!r} has no type sub-attribute")
-
-    def _resolve_fields(self) -> Iterator[checks.CheckMessage]:
-        """Resolve the field of each attribute, and yield what does not fit."""
-        for path, (binding, value) in self._declared.items():
-            key = (binding.model, binding.field_name)
-            if isinstance(value, Many):
-                collection = yield from self._many(path, binding, value)
-                if collection is not None:
-                    self._collections[key] = [collection]
-            elif isinstance(value, Entry):
-                entry = yield from self._entry(path, binding, value)
-                if entry is not None:
-                    self._entries[key] = entry
-                    for entry_column in entry.columns.values():
-                        self._columns[_key(entry_column.binding)] = entry_column
-            elif isinstance(value, list):
-                collections = yield from self._links(path, binding, value)
-                if collections is not None:
-                    self._collections[key] = collections
-            else:
-                column = yield from self._build_column(
-                    self.record, path, binding, value
-                )
-                if column is not None:
-                    self._columns[(*key, binding.sub_field_name)] = column
-
-        yield from self._check_version()
-        yield from self._check_related()
-        if not self._is_resolved():
-            return
-
-        self._id = self._column("id")
-        self._id.textual = not (
-            self._id.transformed or isinstance(self._id.field, _TEXT_FIELDS)
-        )
-        self._id.keyed = self._id.textual or self._id.transformed
-        self._created = self._columns.get(_key(self._resolve("meta.created")))
-        self._last_modified = self._columns.get(
-            _key(self._resolve("meta.lastModified"))
-        )
-        for path, column in (
-            ("meta.created", self._created),
-            ("meta.lastModified", self._last_modified),
-        ):
-            if column is not None and not isinstance(
-                column.field, models.DateTimeField
-            ):
-                yield self._error(
-                    f"{path!r} must be mapped to a date and time field",
-                    "scim2_django.E006",
-                )
-
-        field = self._id.field
-        if field is None or not (
-            field.primary_key or (field.unique and not field.null)
-        ):
-            yield self._error(
-                "'id' must be mapped to the primary key, or to a unique field "
-                "without null",
-                "scim2_django.E005",
-            )
-
-    def _is_resolved(self) -> bool:
-        """Tell whether every required attribute got a column."""
-        return all(
-            _key(self._resolve(path)) in self._columns for path in self._REQUIRED
-        )
-
-    def _check_version(self) -> Iterator[checks.CheckMessage]:
-        """Refuse a version that is not an integer field of the record."""
-        if self.version is None:
-            return
-
-        field = yield from self._field(self.record, self.version, "version")
-        if field is not None and not isinstance(field, models.IntegerField):
-            yield self._error(
-                f"The version {self.version!r} must be an integer field",
-                "scim2_django.E004",
-            )
-
-    def _error(self, message: str, id: str) -> checks.Error:
-        """Return an error about the mapping."""
-        return checks.Error(message, obj=self, id=id)
-
-    def _field(
-        self, model: type[models.Model], name: str, path: str
-    ) -> Generator[checks.CheckMessage, None, Any]:
-        """Return the field of a model, yielding an error when the model has none of that name."""
-        try:
-            field: Any = model._meta.get_field(name)
-        except FieldDoesNotExist:
-            yield self._error(
-                f"{path!r} is mapped to {name!r}, which is not a field of "
-                f"{model._meta.label}",
-                "scim2_django.E001",
-            )
-            return None
-
-        return field
+    def _error(self, message: str, id: str) -> MappingProblem:
+        """Return an error about the mapping, under the identifier of its system check."""
+        return MappingProblem("error", id, message)
 
     def _build_column(
+        self,
+        path: str,
+        binding: AttributeBinding,
+        value: Any,
+        owner: core.Collection | None,
+    ) -> Problems:
+        """Build the column of an attribute, in the resource record or in the entries of owner."""
+        model = self.record if owner is None else owner.entry_model  # type: ignore[attr-defined]
+        column = yield from self._value_column(model, path, binding, value)
+        if column is None:
+            return None
+
+        column.fill(in_record=owner is None)
+        if owner is None and _key(binding) == _key(self._resolve_path("id")):
+            column.textual = not (
+                column.transformed or isinstance(column.field, _TEXT_FIELDS)
+            )
+            column.keyed = column.textual or column.transformed
+
+        return column
+
+    def _value_column(
         self,
         model: type[models.Model],
         path: str,
         binding: AttributeBinding,
         value: Any,
-    ) -> Generator[checks.CheckMessage, None, _Column | None]:
-        """Build the column of an attribute, and decide whether it is written.
+    ) -> Generator[MappingProblem, None, _Column | None]:
+        """Build the column of a declared value, and decide whether it is written.
 
         A read-only attribute, a generated field and a computed expression are
         never written.
@@ -1487,7 +705,7 @@ class ResourceMapping:
             return None
 
         field: Any = column.field
-        if not column.is_string or _key(binding) == _key(self._resolve("id")):
+        if not column.is_string or _key(binding) == _key(self._resolve_path("id")):
             return column
 
         if not _holds_text(field):
@@ -1495,15 +713,31 @@ class ResourceMapping:
             return None
 
         if not column.concealed and _converts(field):
-            yield checks.Warning(
+            yield MappingProblem(
+                "warning",
+                "scim2_django.W001",
                 f"{path!r} is mapped to {attribute.field!r}, whose field converts "
                 "the values it reads: filters and sorts compare the stored values, "
                 "not the values clients read",
-                obj=self,
-                id="scim2_django.W001",
             )
 
         return column
+
+    def _field(
+        self, model: type[models.Model], name: str, path: str
+    ) -> Generator[MappingProblem, None, Any]:
+        """Return the field of a model, yielding an error when the model has none of that name."""
+        try:
+            field: Any = model._meta.get_field(name)
+        except FieldDoesNotExist:
+            yield self._error(
+                f"{path!r} is mapped to {name!r}, which is not a field of "
+                f"{model._meta.label}",
+                "scim2_django.E001",
+            )
+            return None
+
+        return field
 
     def _field_column(
         self,
@@ -1512,7 +746,7 @@ class ResourceMapping:
         binding: AttributeBinding,
         name: str,
         writable: bool,
-    ) -> Generator[checks.CheckMessage, None, _Column | None]:
+    ) -> Generator[MappingProblem, None, _Column | None]:
         """Build the column of a field, of the record or of a record related by a reverse one-to-one relation.
 
         A generated field is never written.
@@ -1551,7 +785,7 @@ class ResourceMapping:
             binding,
             name,
             writable and not field.generated,
-            field,
+            field=field,
             relation=relation,
         )
 
@@ -1562,7 +796,7 @@ class ResourceMapping:
         binding: AttributeBinding,
         transformed: Transformed,
         writable: bool,
-    ) -> Generator[checks.CheckMessage, None, _Column | None]:
+    ) -> Generator[MappingProblem, None, _Column | None]:
         """Build the column of a transformed field, read through its expression and written through to_field.
 
         Without expression, the field is read as it is stored.
@@ -1601,7 +835,7 @@ class ResourceMapping:
 
     def _relation(
         self, model: type[models.Model], path: str, binding: AttributeBinding, name: str
-    ) -> Generator[checks.CheckMessage, None, Any]:
+    ) -> Generator[MappingProblem, None, Any]:
         """Return the reverse one-to-one relation a field name leads through, yielding an error for any other path.
 
         Only a field of the resource record leads through a relation, and only
@@ -1609,7 +843,7 @@ class ResourceMapping:
         """
         relation_name, _, field_name = name.partition("__")
         relation = None
-        if model is self.record and _key(binding) != _key(self._resolve("id")):
+        if model is self.record and _key(binding) != _key(self._resolve_path("id")):
             relation = yield from self._field(model, relation_name, path)
             if relation is None:
                 return None
@@ -1629,12 +863,142 @@ class ResourceMapping:
 
         return relation
 
-    def _check_related(self) -> Iterator[checks.CheckMessage]:
+    def _not_text(self, path: str, holder: str) -> MappingProblem:
+        """Return the error of a string attribute held by something else than text."""
+        return self._error(
+            f"{path!r} is a string, but {holder} does not hold text: "
+            "filters, sorts and writes would not compare or store strings",
+            "scim2_django.E008",
+        )
+
+    def _output_field(
+        self, path: str, alias: str, expression: Any
+    ) -> Generator[MappingProblem, None, Any]:
+        """Return the field an expression gives, yielding an error when the model cannot compute it."""
+        try:
+            query = self.record._default_manager.annotate(**{alias: expression}).query
+            return query.annotations[alias].output_field
+        except FieldError as error:
+            yield self._error(
+                f"{path!r} cannot be computed: {error}", "scim2_django.E009"
+            )
+            return None
+
+    def _build_collection(
+        self,
+        path: str,
+        binding: AttributeBinding,
+        declaration: core.Many | core.Link,
+    ) -> Problems:
+        """Build the collection of a Many or of a Link, on the relation it names."""
+        relation = yield from self._field(self.record, declaration.relation, path)
+        if relation is None:
+            return None
+
+        if isinstance(declaration, core.Many):
+            if not (relation.one_to_many and isinstance(relation, ForeignObjectRel)):
+                yield self._error(
+                    f"{path!r} needs a reverse relation from a foreign key, "
+                    f"but {declaration.relation!r} is not one",
+                    "scim2_django.E003",
+                )
+                return None
+
+            if relation.on_delete is not CASCADE or relation.field.null:
+                yield self._error(
+                    f"The foreign key of {path!r} needs on_delete=CASCADE, "
+                    "and cannot be null",
+                    "scim2_django.E003",
+                )
+                return None
+
+            return _Collection(binding, relation)
+
+        if binding.is_multivalued:
+            if not relation.many_to_many:
+                yield self._link_error(path, declaration, "several entries")
+                return None
+
+            return _Collection(binding, relation)
+
+        if not ((relation.many_to_one or relation.one_to_one) and relation.concrete):
+            yield self._link_error(path, declaration, "one entry")
+            return None
+
+        return _Collection(
+            binding, relation, nullable=bool(relation.null), stores=relation.name
+        )
+
+    def _link_error(self, path: str, link: core.Link, holds: str) -> MappingProblem:
+        """Return the error of a Link whose relation does not fit the number of entries of its attribute."""
+        expected = (
+            "a foreign key or a one-to-one field"
+            if holds == "one entry"
+            else "a many-to-many relation"
+        )
+        return self._error(
+            f"{path!r} holds {holds}, so it needs {expected}, but "
+            f"{link.relation!r} is not one",
+            "scim2_django.E003",
+        )
+
+    def _check_record(self) -> Problems:
+        """Check the version, the related records, the dates and the identifier."""
+        yield from self._check_version()
+        yield from self._check_related()
+        for path, column in (
+            ("meta.created", self._created),
+            ("meta.lastModified", self._last_modified),
+        ):
+            if column is not None and not isinstance(
+                column.field, models.DateTimeField
+            ):
+                yield self._error(
+                    f"{path!r} must be mapped to a date and time field",
+                    "scim2_django.E006",
+                )
+
+        field = self._id.field
+        if field is None or not (
+            field.primary_key or (field.unique and not field.null)
+        ):
+            yield self._error(
+                "'id' must be mapped to the primary key, or to a unique field "
+                "without null",
+                "scim2_django.E005",
+            )
+
+    def _check_version(self) -> Problems:
+        """Refuse a version that is not an integer field of the record, and warn when it has no default."""
+        if self.version is None:
+            return
+
+        field = yield from self._field(self.record, self.version, "version")
+        if field is None:
+            return
+
+        if not isinstance(field, models.IntegerField):
+            yield self._error(
+                f"The version {self.version!r} must be an integer field",
+                "scim2_django.E004",
+            )
+            return
+
+        if _field_needs_value(field):
+            yield MappingProblem(
+                "warning",
+                "scim2_django.W002",
+                f"The field {field.name!r} needs a value, but the storage counts "
+                "the writes from it, and never sets it on creation: give it a "
+                "default",
+            )
+
+    def _check_related(self) -> Problems:
         """Refuse a related model that the storage cannot create from the mapped fields only."""
         mapped: dict[Any, set[str]] = {}
         for column in self._columns.values():
-            if column.relation is not None:
-                mapped.setdefault(column.relation, set()).add(column.field.name)  # type: ignore[union-attr]
+            if column.relation is not None:  # type: ignore[attr-defined]
+                mapped.setdefault(column.relation, set()).add(column.field.name)  # type: ignore[attr-defined]
 
         for relation, names in mapped.items():
             for field in relation.related_model._meta.concrete_fields:
@@ -1653,354 +1017,98 @@ class ResourceMapping:
 
         yield from self._check_dated()
 
-    def _check_dated(self) -> Iterator[checks.CheckMessage]:
+    def _check_dated(self) -> Problems:
         """Refuse a related model holding a date and a mapped field that needs a value.
 
         The storage writes the dates on each write, so each write creates the
         related record, even when the client gives no value for that field.
         """
-        dates = {_key(self._resolve(path)) for path in self._FIELDS}
+        dates = {_key(self._resolve_path(path)) for path in self._FIELDS}
         dated = {
-            column.relation
+            column.relation  # type: ignore[attr-defined]
             for column in self._columns.values()
-            if column.relation is not None and _key(column.binding) in dates
+            if column.relation is not None and _key(column.binding) in dates  # type: ignore[attr-defined]
         }
         for column in self._columns.values():
-            if column.relation not in dated or _key(column.binding) in dates:
+            if column.relation not in dated or _key(column.binding) in dates:  # type: ignore[attr-defined]
                 continue
 
-            if not column.nullable and _field_needs_value(column.field):  # type: ignore[arg-type]
+            if not column.nullable and column.needs_value:
                 yield self._error(
-                    f"{column.relation.get_accessor_name()!r} leads to records "
+                    f"{column.relation.get_accessor_name()!r} leads to records "  # type: ignore[attr-defined]
                     "holding dates, which each write creates, so the field of "
                     f"{column.binding.urn!r} needs null or a default",
                     "scim2_django.E010",
                 )
 
-    def _check_unwritten(self) -> Iterator[checks.CheckMessage]:
-        """Warn about a field of the resource record that needs a value the storage never writes.
+    def _fields_needing_value(self) -> Iterable[str]:
+        """Return the fields of the record a new record needs a value for, but the version.
 
         Django gives an empty string to a text field without value, unless
         it is unique: a second record could not hold it. The parent link of an
         inherited model is set when the parent is saved.
         """
-        dates = {self._created, self._last_modified}
-        written = {
-            column.field.name
-            for column in self._columns.values()
-            if column.field is not None
-            and column.relation is None
-            and (column.writable or column in dates)
-        }
-        written.update(
-            collection.relation.name
-            for collection in self._all_collections()
-            if collection.single and not collection.owned and collection.writable
-        )
-        for field in self.record._meta.concrete_fields:
-            if (
-                field.name in written
-                or not _field_needs_value(field)
-                or (field.empty_strings_allowed and not field.unique)
-                or (field.remote_field is not None and field.remote_field.parent_link)
-            ):
-                continue
+        return [
+            field.name
+            for field in self.record._meta.concrete_fields
+            if _field_needs_value(field)
+            and not (field.empty_strings_allowed and not field.unique)
+            and not (field.remote_field is not None and field.remote_field.parent_link)
+            and field.name != self.version
+        ]
 
-            advice = (
-                "the storage counts the writes from it, but never sets it on "
-                "creation: give it a default"
-                if field.name == self.version
-                else "the storage never writes it, so creating a resource "
-                "fails: map it, or give it a default"
-            )
-            yield checks.Warning(
-                f"The field {field.name!r} of {self.record._meta.label} needs a "
-                f"value, but {advice}",
-                obj=self,
-                id="scim2_django.W002",
-            )
+    def _links_to(self, collection: core.Collection, target: Any) -> bool:
+        target._ready()
+        return bool(collection.entry_model is target.record)  # type: ignore[attr-defined]
 
-    def _always_held(self, binding: AttributeBinding) -> bool:
-        """Tell whether every resource holds an attribute: it is required, and so is its extension."""
-        if not _required(binding):
-            return False
+    def _read(self, column: core.Column, record: Any) -> Any:
+        """Return the SCIM value of a column of a record.
 
-        if not issubclass(binding.model, Extension):
-            return True
-
-        annotation = self.model.get_field_annotation(binding.model.__name__, Required)
-        return bool(annotation == Required.true)
-
-    def _relations(self) -> list[Any]:
-        """Return the relations leading to the records holding mapped fields, by name."""
-        relations = {
-            column.relation.name: column.relation
-            for column in self._columns.values()
-            if column.relation is not None
-        }
-        return [relations[name] for name in sorted(relations)]
-
-    def _related_names(self) -> list[str]:
-        """Return the names select_related takes for the relations leading to the records holding mapped fields."""
-        return [relation.name for relation in self._relations()]
-
-    def _not_text(self, path: str, holder: str) -> checks.Error:
-        """Return the error of a string attribute held by something else than text."""
-        return self._error(
-            f"{path!r} is a string, but {holder} does not hold text: "
-            "filters, sorts and writes would not compare or store strings",
-            "scim2_django.E008",
-        )
-
-    def _output_field(
-        self, path: str, alias: str, expression: Any
-    ) -> Generator[checks.CheckMessage, None, Any]:
-        """Return the field an expression gives, yielding an error when the model cannot compute it."""
-        try:
-            query = self.record._default_manager.annotate(**{alias: expression}).query
-            return query.annotations[alias].output_field
-        except FieldError as error:
-            yield self._error(
-                f"{path!r} cannot be computed: {error}", "scim2_django.E009"
-            )
-            return None
-
-    def _many(
-        self, path: str, binding: AttributeBinding, many: Many
-    ) -> Generator[checks.CheckMessage, None, _Collection | None]:
-        """Build the collection of a Many, with the columns of its entries, or the column of its values."""
-        relation = yield from self._field(self.record, many.relation, path)
-        if relation is None:
-            return None
-
-        if not (relation.one_to_many and isinstance(relation, ForeignObjectRel)):
-            yield self._error(
-                f"{path!r} needs a reverse relation from a foreign key, "
-                f"but {many.relation!r} is not one",
-                "scim2_django.E003",
-            )
-            return None
-
-        if relation.on_delete is not CASCADE or relation.field.null:
-            yield self._error(
-                f"The foreign key of {path!r} needs on_delete=CASCADE, "
-                "and cannot be null",
-                "scim2_django.E003",
-            )
-            return None
-
-        collection = _Collection(binding, relation)
-        entry_model = collection.entry_model
-        if not isinstance(many.attributes, Mapping):
-            column = yield from self._build_column(
-                entry_model, path, binding, many.attributes
-            )
-            if column is None:
-                return None
-
-            collection.columns[None] = column
-            yield from self._check_entries(path, collection)
-            return collection
-
-        for sub_path, name in many.attributes.items():
-            sub_binding = self._resolve(f"{path}.{sub_path}")
-            column = yield from self._build_column(
-                entry_model, f"{path}.{sub_path}", sub_binding, name
-            )
-            if column is None:
-                return None
-
-            collection.columns[sub_binding.sub_field_name] = column
-
-        yield from self._check_entries(path, collection)
-        return collection
-
-    def _entry(
-        self, path: str, binding: AttributeBinding, entry: Entry
-    ) -> Generator[checks.CheckMessage, None, _Entry | None]:
-        """Build the columns of an Entry: those of its fields, and those of its constants.
-
-        A constant has a value when the entry exists only.
+        An empty string is no value, as Django text fields store it.
         """
-        columns: dict[str, _Column] = {}
-        for sub_path, value in entry.attributes.items():
-            sub_binding = self._resolve(f"{path}.{sub_path}")
-            column = yield from self._build_column(
-                self.record, f"{path}.{sub_path}", sub_binding, value
-            )
-            if column is None:
-                return None
-
-            columns[sub_binding.sub_field_name] = column  # type: ignore[index]
-
-        for column in columns.values():
-            column.in_entry = True
-
-        values = columns.values()
-        if any(column.concealed or not column.nullable for column in values):
-            yield self._error(
-                f"The entry of {path!r} exists when one of its fields has a "
-                "value, and a write removing it empties them, so they cannot "
-                "be hidden from clients nor without null",
-                "scim2_django.E007",
-            )
+        value = _get(column, record)  # type: ignore[arg-type]
+        if value is None or (value == "" and column.empty_string):
             return None
 
-        writable = [column.writable for column in values]
-        if any(writable) and not all(writable):
-            yield self._error(
-                f"A write removing the entry of {path!r} empties its fields, so "
-                "they cannot hold a read-only value next to written ones",
-                "scim2_django.E007",
-            )
-            return None
+        return _as_scim(value)
 
-        result = _Entry(binding, columns, {})
-        for name, constant in entry.constants.items():
-            sub_binding = self._resolve(f"{path}.{name}")
-            expression = Case(
-                When(result.present, then=Value(constant)),
-                default=Value(None),
-                output_field=(
-                    models.BooleanField()
-                    if isinstance(constant, bool)
-                    else models.TextField()
-                ),
-            )
-            result.constants[name] = (
-                constant,
-                _Column(sub_binding, name, False, expression=expression),
-            )
+    def _related(self, collection: core.Collection, record: Any) -> list[Any]:
+        """Return the records a collection of a record holds, as a list even for a single one.
 
-        return result
-
-    def _check_entries(
-        self, path: str, collection: _Collection
-    ) -> Iterator[checks.CheckMessage]:
-        """Refuse entries that a write would partly lose.
-
-        A write replaces the entries, so the values a client never sends back
-        would be lost: those of a sub-attribute hidden from clients, and those
-        of a read-only one next to written ones. A PATCH adding entries would lose
-        the write-only ones, since the server patches the resource it read.
+        Without an ordering of their model, the records come in the order of
+        their primary key.
         """
-        columns = collection.columns.values()
-        if any(column.concealed for column in columns):
-            yield self._error(
-                f"The entries of {path!r} are replaced on each write, "
-                "so they cannot hold values hidden from clients",
-                "scim2_django.E007",
-            )
-        elif collection.writable and not all(column.writable for column in columns):
-            yield self._error(
-                f"The entries of {path!r} are replaced on each write, "
-                "so they cannot hold a read-only value next to written ones",
-                "scim2_django.E007",
-            )
+        related = getattr(record, collection.accessor)  # type: ignore[attr-defined]
+        if collection.single:
+            return [] if related is None else [related]
 
-    def _links(
-        self, path: str, binding: AttributeBinding, links: list[Link]
-    ) -> Generator[checks.CheckMessage, None, list[_Collection] | None]:
-        """Build the collections of the Links of an attribute, one per resource type.
+        records = related.all()
+        if not records.ordered:
+            records = records.order_by("pk")
 
-        The type of the entries is compared, in filters, as a constant of each
-        Link.
+        return list(records)
+
+    def _counter(self, record: Any) -> Any:
+        return getattr(record, self.version)  # type: ignore[arg-type]
+
+    def _as_stored(self, value: Any) -> Any:
+        return _as_stored(value)
+
+    def _holds_id(self, record: Any, value: str) -> bool:
+        """Tell whether a record has an identifier.
+
+        A record holds the expression of a transformed identifier, which gives
+        the identifier clients read.
         """
-        collections: list[_Collection] = []
-        for link in links:
-            relation = yield from self._field(self.record, link.relation, path)
-            if relation is None:
-                return None
+        if self._id.transformed:
+            return bool(getattr(record, self._id.key) == value)
 
-            collection = _Collection(binding, relation)
-            fits = relation.many_to_many
-            if collection.single:
-                fits = (
-                    relation.many_to_one or relation.one_to_one
-                ) and relation.concrete
-
-            if not fits:
-                expected = (
-                    "a foreign key or a one-to-one field"
-                    if collection.single
-                    else "a many-to-many relation"
-                )
-                yield self._error(
-                    f"{path!r} holds {'one entry' if collection.single else 'several entries'}, "
-                    f"so it needs {expected}, but {link.relation!r} is not one",
-                    "scim2_django.E003",
-                )
-                return None
-
-            if (
-                collection.single
-                and not relation.null
-                and not self._always_held(binding)
-            ):
-                yield self._error(
-                    f"{path!r} can be removed, or left out with its extension, "
-                    f"so {link.relation!r} needs null=True",
-                    "scim2_django.E003",
-                )
-                return None
-
-            collection.resource_type = link.resource_type
-            if link.type is not None:
-                collection.link_type = link.type
-                collection.type_column = _Column(
-                    self._resolve(f"{path}.type"),
-                    "type",
-                    False,
-                    expression=models.Value(link.type),
-                )
-
-            collections.append(collection)
-
-        return collections
+        return bool(getattr(record, self._id.key) == _exact_key(self._id, value))
 
 
 def _alias(binding: AttributeBinding) -> str:
     """Return the alias records hold the value of an expression under."""
     return "scim_" + binding.urn.replace(":", "_").replace(".", "_")
-
-
-def _key(binding: AttributeBinding) -> tuple[Any, ...]:
-    """Return what tells an attribute apart, whatever the case of its path."""
-    return (binding.model, binding.field_name, binding.sub_field_name)
-
-
-def _overlap(key: tuple[Any, ...], other: tuple[Any, ...]) -> bool:
-    """Tell whether two attributes are the same, or one holds the other."""
-    return key == other or (key[:2] == other[:2] and None in (key[2], other[2]))
-
-
-def _mutabilities(binding: AttributeBinding) -> set[Mutability | None]:
-    """Return the mutabilities an attribute is annotated with, on its own or through its parent."""
-    return {
-        binding.model.get_field_annotation(binding.field_name, Mutability),
-        binding.get_annotation(Mutability),
-    }
-
-
-def _column_storage(column: _Column) -> _Storage:
-    """Return how a column stores its attribute: read and written, or only read."""
-    return _Storage.written if column.writable else _Storage.read_only
-
-
-def _never_returned(binding: AttributeBinding) -> bool:
-    """Tell whether an attribute is never returned to clients, on its own or through its parent."""
-    return Returned.never in (
-        binding.model.get_field_annotation(binding.field_name, Returned),
-        binding.get_annotation(Returned),
-    )
-
-
-def _required(binding: AttributeBinding) -> bool:
-    """Tell whether an attribute is required where it is defined, in the resource or in its extension."""
-    return Required.true in (
-        binding.model.get_field_annotation(binding.field_name, Required),
-        binding.get_annotation(Required),
-    )
 
 
 def _field_needs_value(field: "models.Field[Any, Any]") -> bool:
@@ -2036,6 +1144,89 @@ def _converts(field: "models.Field[Any, Any]") -> bool:
         field = field.output_field  # type: ignore[attr-defined]
 
     return hasattr(field, "from_db_value")
+
+
+def _as_scim(value: Any) -> Any:
+    """Return a value read from the database in the form SCIM holds it.
+
+    A date without a time zone is in UTC: the storage writes it so when USE_TZ
+    is off. Binary values are encoded in base64, as the models expect them.
+    """
+    if isinstance(value, datetime.datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=datetime.UTC)
+
+    if isinstance(value, memoryview):
+        value = bytes(value)
+
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode()
+
+    return value
+
+
+def _as_stored(value: Any) -> Any:
+    """Return a SCIM value in the form a field holds it.
+
+    Dates are in UTC, without a time zone when USE_TZ is off, since Django
+    refuses aware dates then.
+    """
+    if isinstance(value, Enum):
+        return value.value
+
+    if isinstance(value, datetime.datetime) and value.tzinfo is not None:
+        value = value.astimezone(datetime.UTC)
+        return value if settings.USE_TZ else value.replace(tzinfo=None)
+
+    return value
+
+
+def _get(column: _Column, record: Any) -> Any:
+    """Return the value a record holds for a column, None when the related record holding it does not exist.
+
+    The record holds the value of an expression itself, even when the
+    expression reads a related record.
+    """
+    if column.relation is None or column.expression is not None:
+        return getattr(record, column.key)
+
+    related = _related_record(column, record)
+    return None if related is None else getattr(related, column.field.name)  # type: ignore[union-attr]
+
+
+def _related_record(column: _Column, record: Any) -> Any:
+    """Return the related record holding the field of a column, or None when it does not exist."""
+    try:
+        return getattr(record, column.relation.get_accessor_name())
+    except ObjectDoesNotExist:
+        return None
+
+
+def _as_key(column: _Column, value: Any) -> Any:
+    """Return an identifier in the type of its field, or None when the field cannot hold it.
+
+    A transformed identifier is converted by to_field first.
+    """
+    try:
+        if column.to_field is not None:
+            value = column.to_field(value)
+
+        return column.field.to_python(value)  # type: ignore[union-attr]
+    except (TypeError, ValueError, ValidationError):
+        return None
+
+
+def _exact_key(column: _Column, value: str) -> Any:
+    """Return an identifier in the type of its field, or None when the field holds no such identifier.
+
+    The field holds it only when it gives back the same text, so "01" does not
+    find the identifier 1. The expression of a transformed identifier tells
+    it in the database instead.
+    """
+    key = _as_key(column, value)
+    if column.transformed or key is None or str(key) == value:
+        return key
+
+    return None
 
 
 def check_mappings(**kwargs: Any) -> list[checks.CheckMessage]:

@@ -6,6 +6,7 @@ from scim2_models import InvalidValueException
 from scim2_models import Mutability
 from scim2_models import MutabilityException
 from scim2_models import ScimFilter
+from scim2_models import ScimPolicy
 from scim2_models import SearchRequest
 from scim2_models import User
 
@@ -171,6 +172,44 @@ def test_a_sort_on_the_entry_orders_as_search_request_sort(users, sort_order):
     assert [r.user_name for r in page.resources] == [
         r.user_name for r in search_request.sort(everyone)
     ]
+
+
+@pytest.mark.parametrize("sort_order", ["ascending", "descending"])
+@pytest.mark.parametrize("sort_by", ["emails.type", "emails.primary"])
+def test_a_sort_on_a_constant_orders_the_users_without_entry_apart(
+    users, sort_by, sort_order
+):
+    """A constant sorts as the value of the entry, and as no value without entry."""
+    search_request = SearchRequest(sort_by=sort_by, sort_order=sort_order)
+    everyone = users.storage.search([users.users], SearchRequest()).resources
+
+    page = users.storage.search([users.users], search_request)
+
+    expected = search_request.sort(everyone)
+    assert [search_request.sort_value(r) for r in page.resources] == [
+        search_request.sort_value(r) for r in expected
+    ]
+
+
+def refuse_work(binding, value):
+    if value.lower() == "work":
+        raise ValueError("The policy cannot prepare this string")
+
+    return value.lower()
+
+
+@pytest.mark.filterwarnings("ignore:The .* storage cannot compare")
+def test_a_constant_the_policy_cannot_prepare_sorts_as_no_value():
+    server = Server(
+        policy=ScimPolicy(comparison_key=refuse_work),
+        mappings={"User": users_mapping({"emails": EMAILS})},
+    )
+    create(server, "a", [work("alice@example.com")])
+    create(server, "b")
+
+    page = server.storage.search([server.users], SearchRequest(sort_by="emails.type"))
+
+    assert sorted(r.user_name for r in page.resources) == ["a", "b"]
 
 
 def test_the_schema_holds_the_mapped_sub_attributes_and_the_constants():

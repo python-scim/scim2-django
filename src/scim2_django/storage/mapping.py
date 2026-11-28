@@ -57,6 +57,7 @@ _CHECK_IDS = {
     "entry-fields": "scim2_django.E007",
     "single-link-null": "scim2_django.E003",
     "unwritten": "scim2_django.W002",
+    "hidden-unique": "scim2_django.E012",
 }
 """The identifiers of the system checks, by code of the problems of the mapping core."""
 

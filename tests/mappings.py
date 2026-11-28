@@ -8,6 +8,7 @@ from django.db.models.functions import Concat
 from scim2_models import EnterpriseUser
 from scim2_models import Group
 from scim2_models import User
+from scim2_server.testing import Mailbox
 
 from scim2_django.storage import Link
 from scim2_django.storage import Many
@@ -15,6 +16,7 @@ from scim2_django.storage import ResourceMapping
 from scim2_django.storage import Transformed
 
 from .models import GroupRecord
+from .models import MailboxRecord
 from .models import UserRecord
 
 ENTERPRISE = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
@@ -100,3 +102,22 @@ def groups_mapping(changes=None, version="version"):
         path: value for path, value in attributes.items() if value is not None
     }
     return ResourceMapping(Group, GroupRecord, attributes, version=version)
+
+
+def mailboxes_mapping(record=MailboxRecord):
+    """Return a new mapping of the mailboxes of the storage contract."""
+    return ResourceMapping(
+        Mailbox,
+        record,
+        {
+            "id": "id",
+            "displayName": "display_name",
+            "addresses": Many("addresses", {"value": "value", "type": "type"}),
+            "aliases": Many("aliases", "value"),
+            "owner.value": "owner",
+            "owner.display": "owner_display",
+            "meta.created": "created",
+            "meta.lastModified": "last_modified",
+        },
+        version="version",
+    )

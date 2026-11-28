@@ -813,18 +813,15 @@ def test_an_attribute_clients_never_read_is_not_mapped_to_a_generated_field(name
     assert error.id == "scim2_django.E011"
 
 
-def test_a_unique_value_hidden_from_clients_is_not_checked_by_the_storage():
+def test_a_unique_value_hidden_from_clients_is_refused():
     """A refusal would tell a client which serials other users hold."""
     mapping = ResourceMapping(
         User[Sealed],
         UserRecord,
         {"id": "id", "userName": "user_name", f"{SEALED}:serial": "serial"},
     )
-    mapping.schemas()
 
-    assert [column.binding.urn for column in mapping._unique_columns()] == [
-        f"{User.__schema__}:userName"
-    ]
+    assert error_ids(mapping) == ["scim2_django.E012"]
 
 
 def test_a_mapping_with_another_error_is_not_told_about_its_unwritten_fields():

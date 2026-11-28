@@ -109,6 +109,9 @@ The checks report the following errors and warnings:
    * - ``scim2_django.E011``
      - An attribute that clients never read, write-only or never returned, is mapped to a
        generated field, which the storage never writes.
+   * - ``scim2_django.E012``
+     - An attribute that clients never read, write-only or never returned, is unique. Refusing
+       one of its values would tell that another resource holds it.
    * - ``scim2_django.W001``
      - A string attribute that clients read is mapped to a text field that converts the values it
        reads, such as a field decrypting them. Filters and sorts compare the stored values, not

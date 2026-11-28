@@ -10,13 +10,13 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import DEFAULT_DB_ALIAS
 from django.db import IntegrityError
 from django.db import connections
+from django.db import models
 from django.db import transaction
 from django.db.models import F
 from django.db.models import ProtectedError
 from django.db.models import RestrictedError
 from scim2_models import ConflictException
 from scim2_models import NotFoundException
-from scim2_models import Path
 from scim2_models import PreconditionFailedException
 from scim2_models import Resource
 from scim2_models import ResourceType
@@ -25,7 +25,6 @@ from scim2_models import ScimPolicy
 from scim2_models import ScimProvider
 from scim2_models import SearchRequest
 from scim2_models import UniquenessException
-from scim2_models.path import CompareOperator
 from scim2_server.keyset import Bound
 from scim2_server.keyset import Position
 from scim2_server.keyset import keyset_page
@@ -33,11 +32,11 @@ from scim2_server.keyset import page_rows
 from scim2_server.mapping import Collection
 from scim2_server.mapping.conversion import assign_links
 from scim2_server.mapping.conversion import check_storable
-from scim2_server.mapping.conversion import comparable
 from scim2_server.mapping.conversion import link_entries
-from scim2_server.mapping.filters import compare
+from scim2_server.mapping.filters import holds_any
 from scim2_server.storage import ScimStorage
 from scim2_server.storage import SearchPage
+from scim2_server.storage import unique_values
 
 from .comparison import _Comparator
 from .comparison import _comparator
@@ -102,6 +101,12 @@ class DjangoStorage(ScimStorage):
     accepted, so a resource read and sent back can always be written. The
     ``primary`` of the lone entry of an :class:`Entry` is the exception: it
     accepts any value, and reads back as the primary one.
+
+    A unique value another resource holds raises
+    :class:`~scim2_models.UniquenessException`, in any resource type whose
+    schema has the attribute. This holds for sub-attributes too, such as
+    ``emails.value``. Two concurrent writes can take the same value, unless
+    a unique index of the database refuses it.
 
     The storage searches one resource type, or several at the root of the
     server as one collection. It pages by index, or with cursors that give
@@ -280,7 +285,7 @@ class DjangoStorage(ScimStorage):
         mapping = self._mapping(resource_type)
         with transaction.atomic(using=self.using):
             check_storable(mapping, resource, None)
-            self._check_uniqueness(mapping, resource, None)
+            self._check_uniqueness(mapping, resource, None, None)
             links = self._links(mapping, resource)
             record = mapping.record()
             now = _now()
@@ -312,7 +317,7 @@ class DjangoStorage(ScimStorage):
             stored = self._to_scim(resource_type, record)
             self._check_version(stored, expected_version)
             check_storable(mapping, resource, stored)
-            self._check_uniqueness(mapping, resource, stored)
+            self._check_uniqueness(mapping, resource, stored, record)
             links = self._links(mapping, resource)
             self._count_write(mapping, record)
             now = _now()
@@ -565,7 +570,9 @@ class DjangoStorage(ScimStorage):
         except (ProtectedError, RestrictedError) as error:
             raise _referenced() from error
         except IntegrityError as error:
-            self._check_uniqueness(mapping, resource, stored)
+            self._check_uniqueness(
+                mapping, resource, stored, None if stored is None else record
+            )
             if _is_duplicate(error):
                 raise UniquenessException from error
 
@@ -579,38 +586,44 @@ class DjangoStorage(ScimStorage):
         mapping: ResourceMapping,
         resource: Resource[Any],
         stored: Resource[Any] | None,
+        record: Any,
     ) -> None:
         """Refuse a resource with a unique value another resource already has.
 
-        stored is the stored resource, None for a new one. A value it already
-        holds is not checked, so that values another application wrote can
-        stay as they are. A missing value never clashes, as a SQL NULL does
-        not.
+        A value the stored resource already holds is not checked, so that
+        values another application wrote can stay as they are. A missing value
+        never clashes, as a SQL NULL does not.
         """
-        comparator = self._comparator()
-        others = mapping.record._default_manager.using(self.using)
-        if stored is not None:
-            others = others.exclude(_with_ids(mapping._id, [stored.id], comparator))
+        held = {} if stored is None else unique_values(stored, self._policy)
+        for urn, pairs in unique_values(resource, self._policy).items():
+            kept = [key for _, key in held.get(urn, [])]
+            values = [
+                value for value, key in pairs if key is not None and key not in kept
+            ]
+            if values:
+                self._check_values(mapping, urn, values, record)
 
-        for column in mapping._unique_columns():
-            value = Path(column.binding.urn).get(resource, strict=False)
-            current = (
-                None
-                if stored is None
-                else Path(column.binding.urn).get(stored, strict=False)
-            )
-            if value is None or comparable(value) == comparable(current):
+    def _check_values(
+        self, mapping: ResourceMapping, urn: str, values: list[Any], record: Any
+    ) -> None:
+        """Refuse values of an attribute that another resource holds.
+
+        Per RFC 7643 erratum 8279, the values are looked for in every mapping
+        whose schema has the attribute. The written record is left out of the
+        mappings whose records are its own, such as those of a proxy model.
+        """
+        conditions = _Predicates(self._comparator())
+        for other in self.mappings.values():
+            binding = other._unique_attributes().get(urn)
+            if binding is None:
                 continue
 
-            condition = compare(
-                mapping,
-                _Predicates(comparator),
-                self._policy,
-                column,
-                CompareOperator.eq,
-                value,
-            )
-            if others.filter(condition).exists():
+            others = other.record._default_manager.using(self.using)
+            if record is not None and _same_rows(mapping.record, other.record):
+                others = others.exclude(pk=record.pk)
+
+            taken = holds_any(other, conditions, self._policy, binding, values)
+            if others.filter(taken).exists():
                 raise UniquenessException
 
     def _links(
@@ -643,6 +656,19 @@ class DjangoStorage(ScimStorage):
             records = records.annotate(**{target_id.key: target_id.expression})
 
         return list(records)
+
+
+def _same_rows(record: type[models.Model], other: type[models.Model]) -> bool:
+    """Tell whether two models read the same rows, as proxy models, models of multi-table inheritance or models of one table do."""
+    return _root_table(record) == _root_table(other)
+
+
+def _root_table(model: type[models.Model]) -> str:
+    """Return the table of the model at the root of the multi-table inheritance of a model."""
+    concrete = cast(type[models.Model], model._meta.concrete_model)
+    parents = concrete._meta.get_parent_list()
+    root = parents[-1] if parents else concrete
+    return root._meta.db_table
 
 
 def _is_duplicate(error: IntegrityError) -> bool:

@@ -1606,7 +1606,7 @@ mariadb = [
 requires-dist = [
     { name = "django", specifier = ">=5.2" },
     { name = "scim2-models", specifier = ">=0.12.7" },
-    { name = "scim2-server", specifier = ">=0.9.0" },
+    { name = "scim2-server", specifier = ">=0.10.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -1621,7 +1621,7 @@ dev = [
     { name = "pytest-mysql", specifier = ">=5.0.1" },
     { name = "pytest-postgresql", specifier = ">=10.0.0" },
     { name = "scim2-client", specifier = ">=0.14.1" },
-    { name = "scim2-server", extras = ["cursor"], specifier = ">=0.9.0" },
+    { name = "scim2-server", extras = ["cursor"], specifier = ">=0.10.0" },
     { name = "scim2-tester", extras = ["testing"], specifier = ">=0.6.6" },
     { name = "tox-uv", specifier = ">=1.36.0" },
 ]
@@ -1649,14 +1649,14 @@ wheels = [
 
 [[package]]
 name = "scim2-server"
-version = "0.9.0"
+version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "scim2-models" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/83/1d/29fb908e3c6cf5278ebf184e42757a634ce799fef332dfd4f8b793c5b1bc/scim2_server-0.9.0.tar.gz", hash = "sha256:2f7f6c34a9483c4a96ff5f65978a89e0f2e759fdc12dc5c03b6f517330d5b012", size = 90228, upload-time = "2026-11-27T08:53:54.929Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/f3/30ad252c00dd72a8c1270cb0e9f98daa0df5ac4ccdc6f0e5e7bed7a8c212/scim2_server-0.10.0.tar.gz", hash = "sha256:29eba120c131e919560d3a5c5632ce17e6e4da326659efd41c5d16971acbd077", size = 93498, upload-time = "2026-11-27T14:28:56.195Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/57/e6/0303d934ffd1c5101454b6bc74cd3bcfd40c65cc6c12d960d0bb9218afda/scim2_server-0.9.0-py3-none-any.whl", hash = "sha256:fde186347764c941400c08eba6ae3d5022fbfe76aa83e63d14d54f8456e4148e", size = 97077, upload-time = "2026-11-27T08:53:53.534Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/d0/d28e1c1eb4bf576cd6a7afc020cf043689fd0064084833f5f79b7e7a3716/scim2_server-0.10.0-py3-none-any.whl", hash = "sha256:94a4a34f0196fa8654ee91d49a570f4d408b901661df0394d4792dea73abba1c", size = 100433, upload-time = "2026-11-27T14:28:54.84Z" },
 ]
 
 [package.optional-dependencies]

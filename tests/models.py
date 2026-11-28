@@ -333,3 +333,102 @@ class Team(AuthGroup):
 
     class Meta:
         proxy = True
+
+
+class MailboxRecord(models.Model):
+    """A mailbox of the storage contract, whose owner is in its own fields."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    display_name = models.TextField(null=True)
+    owner = models.TextField(null=True)
+    owner_display = models.TextField(null=True)
+    created = models.DateTimeField()
+    last_modified = models.DateTimeField()
+    version = models.PositiveIntegerField(default=1)
+
+
+class MailboxAddressRecord(models.Model):
+    mailbox = models.ForeignKey(
+        MailboxRecord, on_delete=models.CASCADE, related_name="addresses"
+    )
+    value = models.TextField(null=True)
+    type = models.TextField(null=True)
+
+    class Meta:
+        ordering = ["id"]
+
+
+class MailboxAliasRecord(models.Model):
+    mailbox = models.ForeignKey(
+        MailboxRecord, on_delete=models.CASCADE, related_name="aliases"
+    )
+    value = models.TextField()
+
+    class Meta:
+        ordering = ["id"]
+
+
+class SharedMailboxRecord(models.Model):
+    """A shared mailbox of the storage contract, in tables apart from the mailboxes."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    display_name = models.TextField(null=True)
+    owner = models.TextField(null=True)
+    owner_display = models.TextField(null=True)
+    created = models.DateTimeField()
+    last_modified = models.DateTimeField()
+    version = models.PositiveIntegerField(default=1)
+
+
+class SharedMailboxAddressRecord(models.Model):
+    mailbox = models.ForeignKey(
+        SharedMailboxRecord, on_delete=models.CASCADE, related_name="addresses"
+    )
+    value = models.TextField(null=True)
+    type = models.TextField(null=True)
+
+    class Meta:
+        ordering = ["id"]
+
+
+class SharedMailboxAliasRecord(models.Model):
+    mailbox = models.ForeignKey(
+        SharedMailboxRecord, on_delete=models.CASCADE, related_name="aliases"
+    )
+    value = models.TextField()
+
+    class Meta:
+        ordering = ["id"]
+
+
+class ProxyMailboxRecord(MailboxRecord):
+    """The mailboxes, as another resource type reads them."""
+
+    class Meta:
+        proxy = True
+
+
+class RoomRecord(MailboxRecord):
+    """A mailbox of a room, whose fields are those of a mailbox."""
+
+    capacity = models.PositiveIntegerField(null=True)
+
+
+class OfficeRecord(MailboxRecord):
+    """A mailbox of an office, which can share its mailbox with a room."""
+
+    floor = models.PositiveIntegerField(null=True)
+
+
+class MailboxView(models.Model):
+    """The mailboxes, as a model of the same table that Django does not manage."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    display_name = models.TextField(null=True)
+    created = models.DateTimeField()
+    last_modified = models.DateTimeField()
+    version = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        managed = False
+        db_table = MailboxRecord._meta.db_table

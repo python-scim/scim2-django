@@ -6,8 +6,10 @@ from scim2_django.storage import DjangoStorage
 from .mappings import ENTERPRISE
 from .mappings import groups_mapping
 from .mappings import hashed_password
+from .mappings import mailboxes_mapping
 from .mappings import prefixed
 from .mappings import users_mapping
+from .models import SharedMailboxRecord
 
 pytestmark = pytest.mark.django_db
 
@@ -16,6 +18,22 @@ class TestDjangoStorage(ScimStorageContract):
     @pytest.fixture
     def storage(self, provider):
         mappings = {"User": users_mapping(), "Group": groups_mapping()}
+        return DjangoStorage(mappings, provider)
+
+
+class TestDjangoStorageWithMailboxes(ScimStorageContract):
+    """Mailboxes whose unique values are in their records and in tables beside them."""
+
+    stores_mailboxes = True
+
+    @pytest.fixture
+    def storage(self, provider):
+        mappings = {
+            "User": users_mapping(),
+            "Group": groups_mapping(),
+            "Mailbox": mailboxes_mapping(),
+            "SharedMailbox": mailboxes_mapping(SharedMailboxRecord),
+        }
         return DjangoStorage(mappings, provider)
 
 

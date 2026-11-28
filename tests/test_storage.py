@@ -19,6 +19,8 @@ from scim2_models import ScimProvider
 from scim2_models import SearchRequest
 from scim2_models import UniquenessException
 from scim2_models import User
+from scim2_server.testing import MAILBOX_TYPES
+from scim2_server.testing import Mailbox
 from scim2_server.utils import load_default_provider
 from scim2_server.utils import load_default_service_provider_config
 
@@ -26,16 +28,24 @@ from scim2_django import ScimSite
 from scim2_django.storage import DjangoStorage
 from scim2_django.storage import ResourceMapping
 from scim2_django.storage.comparison import _vendor
+from scim2_django.storage.storage import _same_rows
 
 from .mappings import groups_mapping
+from .mappings import mailboxes_mapping
 from .mappings import users_mapping
 from .models import AliasRecord
 from .models import BadgeRecord
 from .models import EmailRecord
 from .models import Locker
 from .models import LogRecord
+from .models import MailboxRecord
+from .models import MailboxView
+from .models import OfficeRecord
 from .models import PassRecord
 from .models import Person
+from .models import ProxyMailboxRecord
+from .models import RoomRecord
+from .models import SharedMailboxRecord
 from .models import UserRecord
 from .models import Volunteer
 from .test_mapping import OWNED
@@ -142,10 +152,10 @@ class Racing(DjangoStorage):
 
     checks = 0
 
-    def _check_uniqueness(self, mapping, resource, stored):
+    def _check_uniqueness(self, mapping, resource, stored, record):
         self.checks += 1
         if self.checks % 2 == 0:
-            super()._check_uniqueness(mapping, resource, stored)
+            super()._check_uniqueness(mapping, resource, stored, record)
 
 
 def test_a_unique_value_taken_in_the_meantime_is_refused():
@@ -330,7 +340,7 @@ def test_a_group_resource_type_without_provider():
 
 
 def test_a_unique_value_written_by_another_application_can_stay(server):
-    """A user whose name differs from another one by its case only can still be changed."""
+    """A user whose name differs from another one by its case only can still be changed, along with the case of its name."""
     if _vendor(connection) == "mariadb":
         pytest.skip("The unique index of MariaDB ignores the case, as the column does")
 
@@ -344,8 +354,7 @@ def test_a_unique_value_written_by_another_application_can_stay(server):
     assert server.storage.update(server.users, other).display_name == "Other Alice"
 
     other.user_name = "ALICE"
-    with pytest.raises(UniquenessException):
-        server.storage.update(server.users, other)
+    assert server.storage.update(server.users, other).user_name == "ALICE"
 
 
 def test_a_new_resource_cannot_take_a_value_by_giving_the_identifier_of_its_holder(
@@ -555,3 +564,88 @@ def test_a_value_never_returned_cannot_be_searched(search_request, error):
 
     with pytest.raises(error):
         storage.search([lockers], search_request)
+
+
+def owners_mapping(record):
+    """Return a mapping of the mailboxes whose owner is in the field of their display name."""
+    return ResourceMapping(
+        Mailbox,
+        record,
+        {
+            "id": "id",
+            "owner.value": "display_name",
+            "meta.created": "created",
+            "meta.lastModified": "last_modified",
+        },
+        version="version",
+    )
+
+
+def mailbox_storage(owners):
+    """Return a storage of the mailboxes, whose shared mailboxes are read by a mapping of the owners."""
+    provider = ScimProvider(models=[Mailbox], resource_types=MAILBOX_TYPES)
+    mappings = {"Mailbox": mailboxes_mapping(), "SharedMailbox": owners}
+    return DjangoStorage(mappings, provider)
+
+
+SHARING_RECORDS = pytest.mark.parametrize(
+    "record",
+    [ProxyMailboxRecord, RoomRecord, MailboxView],
+    ids=["proxy", "multi-table", "same table"],
+)
+
+
+@SHARING_RECORDS
+def test_a_record_another_resource_type_reads_does_not_clash_with_itself(record):
+    """The record holds the owner in another field for the shared mailboxes, as the same resource."""
+    mailboxes, shared_mailboxes = MAILBOX_TYPES
+    storage = mailbox_storage(owners_mapping(record))
+    shared = storage.create(shared_mailboxes, Mailbox(owner={"value": "bjensen"}))
+    mailbox = storage.get(mailboxes, shared.id)
+    mailbox.owner = {"value": "bjensen"}
+
+    updated = storage.update(mailboxes, mailbox)
+
+    assert updated.owner.value == "bjensen"
+    assert MailboxRecord.objects.get().owner == "bjensen"
+
+
+@SHARING_RECORDS
+def test_another_record_another_resource_type_reads_clashes(record):
+    """Only the written record is left out of the mappings reading its rows."""
+    mailboxes, shared_mailboxes = MAILBOX_TYPES
+    storage = mailbox_storage(owners_mapping(record))
+    storage.create(shared_mailboxes, Mailbox(owner={"value": "bjensen"}))
+    mailbox = storage.create(mailboxes, Mailbox(display_name="Babs"))
+    mailbox.owner = {"value": "bjensen"}
+
+    with pytest.raises(UniquenessException):
+        storage.update(mailboxes, mailbox)
+
+
+@pytest.mark.parametrize(
+    ("record", "other", "same"),
+    [
+        (MailboxRecord, ProxyMailboxRecord, True),
+        (RoomRecord, MailboxRecord, True),
+        (RoomRecord, OfficeRecord, True),
+        (MailboxView, MailboxRecord, True),
+        (MailboxRecord, SharedMailboxRecord, False),
+    ],
+    ids=["proxy", "multi-table", "siblings", "same table", "other table"],
+)
+def test_models_reading_the_same_rows(record, other, same):
+    """Two children of one model can share the row of their parent."""
+    assert _same_rows(record, other) is same
+    assert _same_rows(other, record) is same
+
+
+def test_a_unique_value_another_resource_type_holds_can_stay():
+    """A mailbox keeps the owner that another application gave a shared mailbox too."""
+    mailboxes, _ = MAILBOX_TYPES
+    storage = mailbox_storage(mailboxes_mapping(SharedMailboxRecord))
+    mailbox = storage.create(mailboxes, Mailbox(owner={"value": "bjensen"}))
+    SharedMailboxRecord.objects.create(owner="bjensen", created=NOW, last_modified=NOW)
+    mailbox.display_name = "Babs"
+
+    assert storage.update(mailboxes, mailbox).display_name == "Babs"

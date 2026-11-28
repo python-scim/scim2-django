@@ -1,6 +1,20 @@
 Changelog
 =========
 
+[Unreleased]
+------------
+
+Added
+^^^^^
+- Unique sub-attributes such as ``emails.value`` are checked, each value of a list on its own, in
+  every resource type sharing the schema (RFC 7643 erratum 8279).
+
+Changed
+^^^^^^^
+- Needs scim2-server 0.10.0 or later.
+- ``manage.py check`` refuses a unique attribute that clients never read (``E012``).
+- A resource can change the case of a unique value it already holds.
+
 [0.3.0] - 2026-11-27
 --------------------
 
